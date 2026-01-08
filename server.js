@@ -102,7 +102,35 @@ async function createLightningInvoice(amountSats, orderId) {
       data.bolt11 ||
       null;
 
-    if (!lightningInvoice && hostedInvoiceUrl) lightningInvoice = hostedInvoiceUrl;
+    const isBolt11 = typeof lightningInvoice === 'string' && lightningInvoice.toLowerCase().startsWith('ln');
+    if (!isBolt11) lightningInvoice = null;
+
+    if (!lightningInvoice && invoiceId) {
+      try {
+        const details = await axios.get(`${SPEED_API_BASE}/payments/${invoiceId}`, {
+          headers: {
+            Authorization: `Basic ${header}`,
+            'Content-Type': 'application/json',
+            'speed-version': '2022-04-15',
+            ...extraHeaders
+          },
+          timeout: 10000
+        });
+
+        const d = details.data;
+        const maybe =
+          d?.payment_method_options?.lightning?.payment_request ||
+          d?.lightning_invoice ||
+          d?.invoice ||
+          d?.payment_request ||
+          d?.bolt11 ||
+          null;
+
+        const ok = typeof maybe === 'string' && maybe.toLowerCase().startsWith('ln');
+        if (ok) lightningInvoice = maybe;
+      } catch {
+      }
+    }
 
     if (!invoiceId) throw new Error(`[${label}] No invoice ID returned from Speed API`);
 
