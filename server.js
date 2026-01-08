@@ -59,7 +59,7 @@ function pickPayoutAmount(betAmount) {
   return { payoutAmount: opts[idx], payoutOptions: opts };
 }
 
-async function createLightningInvoice(amountSats, orderId) {
+async function createLightningInvoice(amountSats, orderId, extraMetadata = {}) {
   if (!amountSats || Number.isNaN(Number(amountSats))) {
     throw new Error('Invalid amount');
   }
@@ -76,7 +76,8 @@ async function createLightningInvoice(amountSats, orderId) {
     metadata: {
       Order_ID: orderId,
       Game_Type: 'BTC_Slides',
-      Amount_SATS: String(amountSats)
+      Amount_SATS: String(amountSats),
+      ...extraMetadata
     }
   };
 
@@ -212,6 +213,71 @@ app.get('/health', (req, res) => {
 const invoiceToSocket = new Map();
 const roundsByInvoice = new Map();
 
+function extractInvoiceIdFromEvent(event) {
+  const candidates = [
+    event?.data?.object?.id,
+    event?.data?.id,
+    event?.data?.object?.payment?.id,
+    event?.data?.object?.invoice?.id,
+    event?.data?.object?.payment_id,
+    event?.data?.object?.invoice_id
+  ];
+  const found = candidates.find((v) => typeof v === 'string' && v.trim());
+  return found || null;
+}
+
+function isPaidLikeStatus(status) {
+  const s = String(status || '').toLowerCase();
+  if (!s) return false;
+  return s.includes('paid') || s.includes('confirm') || s.includes('succeed') || s.includes('complete');
+}
+
+async function fetchPaymentDetails(invoiceId) {
+  const header = AUTH_HEADER || PUB_AUTH_HEADER;
+  if (!header) throw new Error('Missing Speed auth header (set SPEED_WALLET_SECRET_KEY or SPEED_WALLET_PUBLISHABLE_KEY)');
+
+  const headers = {
+    Authorization: `Basic ${header}`,
+    'Content-Type': 'application/json'
+  };
+  if (AUTH_HEADER) headers['speed-version'] = '2022-04-15';
+
+  const details = await axios.get(`${SPEED_API_BASE}/payments/${invoiceId}`, {
+    headers,
+    timeout: 10000
+  });
+
+  return details.data;
+}
+
+async function verifyInvoicePaidWithSpeed(invoiceId) {
+  const details = await fetchPaymentDetails(invoiceId);
+  const status = details?.status || details?.payment_status || details?.state || null;
+  const paid = Boolean(details?.paid) || isPaidLikeStatus(status);
+  return { paid, status, details };
+}
+
+function extractRoundFromPaymentDetails(invoiceId, details, socketId) {
+  const md = details?.metadata || {};
+  const addr = String(md.Lightning_Address || md.lightning_address || md.lightningAddress || '').trim().toLowerCase();
+  const bet = Number(md.Amount_SATS || md.amount_sats || details?.amount || details?.amount_sats);
+
+  if (!addr || !addr.includes('@')) return null;
+  if (!Number.isFinite(bet) || bet <= 0) return null;
+  if (!BET_OPTIONS.includes(bet)) return null;
+
+  return {
+    roundId: String(md.Order_ID || `recovered_${invoiceId}`),
+    socketId: socketId || null,
+    invoiceId,
+    lightningAddress: formatLightningAddress(addr),
+    betAmount: bet,
+    status: 'invoice_created',
+    createdAt: new Date().toISOString(),
+    recovered: true
+  };
+}
+
 function scheduleRoundCleanup(invoiceId, delayMs = 30 * 60 * 1000) {
   setTimeout(() => {
     roundsByInvoice.delete(invoiceId);
@@ -219,85 +285,155 @@ function scheduleRoundCleanup(invoiceId, delayMs = 30 * 60 * 1000) {
   }, delayMs);
 }
 
+async function processPaidInvoice(invoiceId, opts = {}) {
+  const round = roundsByInvoice.get(invoiceId);
+  if (!round) {
+    return { ok: false, reason: 'unknown_invoice' };
+  }
+
+  const socketId = opts?.socketId || invoiceToSocket.get(invoiceId) || round.socketId;
+  if (opts?.socketId) {
+    invoiceToSocket.set(invoiceId, opts.socketId);
+    round.socketId = opts.socketId;
+  }
+
+  const sock = socketId && io.sockets.sockets.get(socketId);
+
+  if (round.status === 'invoice_created') {
+    round.status = 'paid';
+  }
+
+  if (sock && !round.paymentVerifiedEmitted) {
+    round.paymentVerifiedEmitted = true;
+    sock.emit('paymentVerified');
+  }
+
+  if (!Number.isFinite(Number(round.payoutAmount))) {
+    const { payoutAmount, payoutOptions } = pickPayoutAmount(round.betAmount);
+    round.payoutAmount = payoutAmount;
+    round.payoutOptions = payoutOptions;
+  }
+
+  const spinOutcome = {
+    invoiceId,
+    betAmount: round.betAmount,
+    payoutAmount: round.payoutAmount,
+    payoutOptions: round.payoutOptions || PAYOUT_TABLE[round.betAmount] || [0, round.betAmount]
+  };
+
+  if (sock && !round.spinEmitted) {
+    round.spinEmitted = true;
+    sock.emit('spinOutcome', spinOutcome);
+  }
+
+  if (round.status === 'payout_sent') {
+    return { ok: true, alreadyProcessed: true, payoutAmount: round.payoutAmount, spinOutcome };
+  }
+
+  const payoutAmount = Number(round.payoutAmount) || 0;
+  if (round.payoutInProgress) {
+    return { ok: true, payoutInProgress: true, payoutAmount, spinOutcome };
+  }
+
+  round.payoutInProgress = true;
+
+  if (payoutAmount > 0) {
+    try {
+      const payoutResp = await sendInstantPayment(
+        round.lightningAddress,
+        payoutAmount,
+        `BTC Slides payout - Invoice ${invoiceId} - ${payoutAmount} SATS`
+      );
+
+      round.status = 'payout_sent';
+      round.payoutResponse = payoutResp;
+
+      if (sock) {
+        sock.emit('payoutSent', {
+          invoiceId,
+          payoutAmount,
+          recipient: round.lightningAddress,
+          payoutResponse: payoutResp
+        });
+      }
+    } catch (e) {
+      round.status = 'paid';
+      round.payoutError = String(e.message || e);
+
+      if (sock) {
+        sock.emit('payoutFailed', {
+          invoiceId,
+          payoutAmount,
+          recipient: round.lightningAddress,
+          error: round.payoutError
+        });
+      }
+    }
+  } else {
+    round.status = 'payout_sent';
+    if (sock) {
+      sock.emit('payoutSent', {
+        invoiceId,
+        payoutAmount: 0,
+        recipient: round.lightningAddress,
+        payoutResponse: null
+      });
+    }
+  }
+
+  scheduleRoundCleanup(invoiceId);
+  return { ok: true, payoutAmount, spinOutcome };
+}
+
+app.get('/verify/:invoiceId', async (req, res) => {
+  const invoiceId = String(req.params.invoiceId || '').trim();
+  const socketId = String(req.query.socketId || '').trim() || null;
+  if (!invoiceId) return res.status(400).json({ error: 'Missing invoiceId' });
+
+  try {
+    let roundKnown = roundsByInvoice.has(invoiceId);
+    const { paid, status, details } = await verifyInvoicePaidWithSpeed(invoiceId);
+    if (!paid) {
+      return res.json({ ok: true, invoiceId, paid: false, status: status || 'unknown', roundKnown });
+    }
+
+    if (!roundKnown) {
+      const recovered = extractRoundFromPaymentDetails(invoiceId, details, socketId);
+      if (recovered) {
+        roundsByInvoice.set(invoiceId, recovered);
+        if (socketId) invoiceToSocket.set(invoiceId, socketId);
+        roundKnown = true;
+      }
+    }
+
+    const processed = await processPaidInvoice(invoiceId, { socketId });
+    return res.json({ ok: true, invoiceId, paid: true, status: status || 'paid', roundKnown, processed });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 app.post('/webhook', express.json(), async (req, res) => {
   const event = req.body;
   const eventType = event?.event_type;
 
   try {
-    if (eventType === 'invoice.paid' || eventType === 'payment.paid' || eventType === 'payment.confirmed') {
-      const invoiceId = event?.data?.object?.id || event?.data?.id;
+    const paidish = /paid|confirm|succeed|complete/i.test(String(eventType || ''));
+    if (paidish) {
+      const invoiceId = extractInvoiceIdFromEvent(event);
       if (!invoiceId) return res.status(400).send('No invoiceId in webhook payload');
 
       const round = roundsByInvoice.get(invoiceId);
       if (!round) return res.status(200).send('Webhook received (unknown invoice)');
-      if (round.status === 'paid' || round.status === 'payout_sent') {
+      if (round.status === 'payout_sent') {
         return res.status(200).send('Webhook received (already processed)');
       }
 
-      round.status = 'paid';
-
-      const socketId = invoiceToSocket.get(invoiceId) || round.socketId;
-      const sock = socketId && io.sockets.sockets.get(socketId);
-      if (sock) sock.emit('paymentVerified');
-
-      const { payoutAmount, payoutOptions } = pickPayoutAmount(round.betAmount);
-      round.payoutAmount = payoutAmount;
-
-      if (sock) {
-        sock.emit('spinOutcome', {
-          betAmount: round.betAmount,
-          payoutAmount,
-          payoutOptions
-        });
-      }
-
-      if (payoutAmount > 0) {
-        try {
-          const payoutResp = await sendInstantPayment(
-            round.lightningAddress,
-            payoutAmount,
-            `BTC Slides payout - Invoice ${invoiceId} - ${payoutAmount} SATS`
-          );
-
-          round.status = 'payout_sent';
-          round.payoutResponse = payoutResp;
-
-          if (sock) {
-            sock.emit('payoutSent', {
-              payoutAmount,
-              recipient: round.lightningAddress,
-              payoutResponse: payoutResp
-            });
-          }
-        } catch (e) {
-          round.status = 'paid';
-          round.payoutError = String(e.message || e);
-
-          if (sock) {
-            sock.emit('payoutFailed', {
-              payoutAmount,
-              recipient: round.lightningAddress,
-              error: round.payoutError
-            });
-          }
-        }
-      } else {
-        round.status = 'payout_sent';
-        if (sock) {
-          sock.emit('payoutSent', {
-            payoutAmount: 0,
-            recipient: round.lightningAddress,
-            payoutResponse: null
-          });
-        }
-      }
-
-      invoiceToSocket.delete(invoiceId);
-      scheduleRoundCleanup(invoiceId);
+      await processPaidInvoice(invoiceId);
     }
 
     if (eventType === 'payment.failed') {
-      const invoiceId = event?.data?.object?.id || event?.data?.id;
+      const invoiceId = extractInvoiceIdFromEvent(event);
       if (invoiceId) {
         const socketId = invoiceToSocket.get(invoiceId);
         const sock = socketId && io.sockets.sockets.get(socketId);
@@ -339,7 +475,9 @@ io.on('connection', (socket) => {
       const formattedAddress = formatLightningAddress(lightningAddress);
 
       const roundId = `round_${Date.now()}_${socket.id}`;
-      const invoiceData = await createLightningInvoice(bet, `order_${roundId}`);
+      const invoiceData = await createLightningInvoice(bet, `order_${roundId}`, {
+        Lightning_Address: formattedAddress
+      });
 
       const round = {
         roundId,
