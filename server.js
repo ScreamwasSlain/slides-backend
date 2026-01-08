@@ -226,10 +226,24 @@ function extractInvoiceIdFromEvent(event) {
   return found || null;
 }
 
+function normalizeSpeedStatus(status) {
+  return String(status || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_');
+}
+
 function isPaidLikeStatus(status) {
-  const s = String(status || '').toLowerCase();
+  const s = normalizeSpeedStatus(status);
   if (!s) return false;
-  return s.includes('paid') || s.includes('confirm') || s.includes('succeed') || s.includes('complete');
+
+  const tokens = s.split(/[._-]+/g).filter(Boolean);
+  if (tokens.includes('unpaid') || tokens.includes('not_paid') || tokens.includes('not') && tokens.includes('paid')) {
+    return false;
+  }
+
+  const paidTokens = new Set(['paid', 'confirmed', 'succeeded', 'success', 'complete', 'completed']);
+  return tokens.some((t) => paidTokens.has(t));
 }
 
 async function fetchPaymentDetails(invoiceId) {
@@ -253,7 +267,8 @@ async function fetchPaymentDetails(invoiceId) {
 async function verifyInvoicePaidWithSpeed(invoiceId) {
   const details = await fetchPaymentDetails(invoiceId);
   const status = details?.status || details?.payment_status || details?.state || null;
-  const paid = Boolean(details?.paid) || isPaidLikeStatus(status);
+  const paidFlag = details?.paid === true || details?.is_paid === true || details?.paid_at != null;
+  const paid = Boolean(paidFlag) || isPaidLikeStatus(status);
   return { paid, status, details };
 }
 
@@ -289,6 +304,13 @@ async function processPaidInvoice(invoiceId, opts = {}) {
   const round = roundsByInvoice.get(invoiceId);
   if (!round) {
     return { ok: false, reason: 'unknown_invoice' };
+  }
+
+  if (!opts?.paidVerified) {
+    const { paid, status } = await verifyInvoicePaidWithSpeed(invoiceId);
+    if (!paid) {
+      return { ok: false, reason: 'not_paid', status: status || 'unknown' };
+    }
   }
 
   const socketId = opts?.socketId || invoiceToSocket.get(invoiceId) || round.socketId;
@@ -406,7 +428,7 @@ app.get('/verify/:invoiceId', async (req, res) => {
       }
     }
 
-    const processed = await processPaidInvoice(invoiceId, { socketId });
+    const processed = await processPaidInvoice(invoiceId, { socketId, paidVerified: true });
     return res.json({ ok: true, invoiceId, paid: true, status: status || 'paid', roundKnown, processed });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
@@ -418,19 +440,7 @@ app.post('/webhook', express.json(), async (req, res) => {
   const eventType = event?.event_type;
 
   try {
-    const paidish = /paid|confirm|succeed|complete/i.test(String(eventType || ''));
-    if (paidish) {
-      const invoiceId = extractInvoiceIdFromEvent(event);
-      if (!invoiceId) return res.status(400).send('No invoiceId in webhook payload');
-
-      const round = roundsByInvoice.get(invoiceId);
-      if (!round) return res.status(200).send('Webhook received (unknown invoice)');
-      if (round.status === 'payout_sent') {
-        return res.status(200).send('Webhook received (already processed)');
-      }
-
-      await processPaidInvoice(invoiceId);
-    }
+    const invoiceId = extractInvoiceIdFromEvent(event);
 
     if (eventType === 'payment.failed') {
       const invoiceId = extractInvoiceIdFromEvent(event);
@@ -445,6 +455,21 @@ app.post('/webhook', express.json(), async (req, res) => {
         invoiceToSocket.delete(invoiceId);
         scheduleRoundCleanup(invoiceId, 5 * 60 * 1000);
       }
+    }
+
+    if (invoiceId) {
+      const round = roundsByInvoice.get(invoiceId);
+      if (!round) return res.status(200).send('Webhook received (unknown invoice)');
+      if (round.status === 'payout_sent') {
+        return res.status(200).send('Webhook received (already processed)');
+      }
+
+      const { paid, status } = await verifyInvoicePaidWithSpeed(invoiceId);
+      if (!paid) {
+        return res.status(200).send(`Webhook received (not paid yet: ${status || 'unknown'})`);
+      }
+
+      await processPaidInvoice(invoiceId, { paidVerified: true });
     }
 
     res.status(200).send('Webhook received');
