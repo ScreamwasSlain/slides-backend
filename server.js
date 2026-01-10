@@ -39,6 +39,39 @@ const PAYOUT_TABLE = {
   10000: [0, 2000, 5000, 12000, 30000]
 };
 
+const PAYOUT_WEIGHTS = {
+  20: [36, 50, 9, 4, 1],
+  100: null,
+  300: null,
+  500: null,
+  1000: null,
+  5000: null,
+  10000: [250, 250, 250, 249, 1]
+};
+
+function pickWeighted(options, weights) {
+  const opts = Array.isArray(options) ? options : [];
+  if (opts.length === 0) return { value: 0, weights: [] };
+
+  const w = Array.isArray(weights) && weights.length === opts.length
+    ? weights.map((n) => Math.max(0, Math.floor(Number(n) || 0)))
+    : opts.map(() => 1);
+
+  const total = w.reduce((a, b) => a + b, 0);
+  if (!Number.isFinite(total) || total <= 0) {
+    const idx = crypto.randomInt(0, opts.length);
+    return { value: opts[idx], weights: opts.map(() => 1) };
+  }
+
+  const r = crypto.randomInt(0, Math.floor(total));
+  let acc = 0;
+  for (let i = 0; i < opts.length; i += 1) {
+    acc += w[i];
+    if (r < acc) return { value: opts[i], weights: w };
+  }
+  return { value: opts[opts.length - 1], weights: w };
+}
+
 function getCorsOrigins() {
   const raw = (process.env.CORS_ORIGIN || '').trim();
   if (!raw) return true;
@@ -55,8 +88,9 @@ function formatLightningAddress(input) {
 
 function pickPayoutAmount(betAmount) {
   const opts = PAYOUT_TABLE[betAmount] || [0, betAmount];
-  const idx = crypto.randomInt(0, opts.length);
-  return { payoutAmount: opts[idx], payoutOptions: opts };
+  const weights = PAYOUT_WEIGHTS?.[betAmount] || null;
+  const picked = pickWeighted(opts, weights);
+  return { payoutAmount: picked.value, payoutOptions: opts, payoutWeights: picked.weights };
 }
 
 async function createLightningInvoice(amountSats, orderId, extraMetadata = {}) {
@@ -331,16 +365,18 @@ async function processPaidInvoice(invoiceId, opts = {}) {
   }
 
   if (!Number.isFinite(Number(round.payoutAmount))) {
-    const { payoutAmount, payoutOptions } = pickPayoutAmount(round.betAmount);
+    const { payoutAmount, payoutOptions, payoutWeights } = pickPayoutAmount(round.betAmount);
     round.payoutAmount = payoutAmount;
     round.payoutOptions = payoutOptions;
+    round.payoutWeights = payoutWeights;
   }
 
   const spinOutcome = {
     invoiceId,
     betAmount: round.betAmount,
     payoutAmount: round.payoutAmount,
-    payoutOptions: round.payoutOptions || PAYOUT_TABLE[round.betAmount] || [0, round.betAmount]
+    payoutOptions: round.payoutOptions || PAYOUT_TABLE[round.betAmount] || [0, round.betAmount],
+    payoutWeights: round.payoutWeights || null
   };
 
   if (sock && !round.spinEmitted) {
@@ -490,7 +526,9 @@ const io = new Server(server, {
 
 io.on('connection', (socket) => {
   socket.emit('serverInfo', {
-    betOptions: BET_OPTIONS
+    betOptions: BET_OPTIONS,
+    payoutTable: PAYOUT_TABLE,
+    payoutWeights: PAYOUT_WEIGHTS
   });
 
   socket.on('startSpin', async ({ lightningAddress, betAmount }) => {
