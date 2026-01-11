@@ -41,12 +41,12 @@ const PAYOUT_TABLE = {
 
 const PAYOUT_WEIGHTS = {
   20: [36, 50, 9, 4, 1],
-  100: null,
-  300: null,
-  500: null,
-  1000: null,
-  5000: null,
-  10000: [250, 250, 250, 249, 1]
+  100: [36, 50, 9, 4, 1],
+  300: [36, 50, 9, 4, 1],
+  500: [36, 50, 9, 4, 1],
+  1000: [36, 50, 9, 4, 1],
+  5000: [36, 50, 9, 4, 1],
+  10000: [2500, 2500, 2500, 249, 1]
 };
 
 function pickWeighted(options, weights) {
@@ -54,7 +54,7 @@ function pickWeighted(options, weights) {
   if (opts.length === 0) return { value: 0, weights: [] };
 
   const w = Array.isArray(weights) && weights.length === opts.length
-    ? weights.map((n) => Math.max(0, Math.floor(Number(n) || 0)))
+    ? weights.map((n) => Math.max(0, Number(n) || 0))
     : opts.map(() => 1);
 
   const total = w.reduce((a, b) => a + b, 0);
@@ -63,7 +63,7 @@ function pickWeighted(options, weights) {
     return { value: opts[idx], weights: opts.map(() => 1) };
   }
 
-  const r = crypto.randomInt(0, Math.floor(total));
+  const r = (crypto.randomInt(0, 2 ** 32) / (2 ** 32)) * total;
   let acc = 0;
   for (let i = 0; i < opts.length; i += 1) {
     acc += w[i];
