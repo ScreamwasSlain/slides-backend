@@ -60,6 +60,7 @@ function serializeWallet(w) {
     secretSetAt: w.secretSetAt || null,
     pendingWithdrawal: w.pendingWithdrawal || null,
     lastWithdrawal: w.lastWithdrawal || null,
+    onboardingSpinsByBet: w.onboardingSpinsByBet && typeof w.onboardingSpinsByBet === 'object' ? w.onboardingSpinsByBet : null,
     walletSecretHash: Buffer.isBuffer(w.walletSecretHash) ? w.walletSecretHash.toString('hex') : (w.walletSecretHash || null)
   };
 }
@@ -145,6 +146,7 @@ function loadWalletStore() {
         secretSetAt: item?.secretSetAt || null,
         pendingWithdrawal: item?.pendingWithdrawal || null,
         lastWithdrawal: item?.lastWithdrawal || null,
+        onboardingSpinsByBet: item?.onboardingSpinsByBet && typeof item.onboardingSpinsByBet === 'object' ? item.onboardingSpinsByBet : null,
         walletSecretHash: item?.walletSecretHash || null
       });
     }
@@ -215,6 +217,11 @@ const PAYOUT_WEIGHTS = {
   1000: [36, 50, 9, 4, 1],
   5000: [36, 50, 9, 4, 1],
   10000: [2500, 2500, 2500, 249, 1]
+};
+
+const ONBOARDING_PAYOUTS_BY_BET = {
+  20: [50, 20, 50, 0, 0, 80],
+  100: [120, 120, 50, 0, 50, 0]
 };
 
 function pickWeighted(options, weights) {
@@ -370,6 +377,34 @@ function pickPayoutAmount(betAmount) {
   const weights = PAYOUT_WEIGHTS?.[betAmount] || null;
   const picked = pickWeighted(opts, weights);
   return { payoutAmount: picked.value, payoutOptions: opts, payoutWeights: picked.weights };
+}
+
+function pickPayoutAmountForWallet(walletId, betAmount) {
+  const bet = Number(betAmount);
+  const base = pickPayoutAmount(bet);
+  const seq = ONBOARDING_PAYOUTS_BY_BET?.[bet];
+  if (!Array.isArray(seq) || seq.length === 0) return base;
+
+  const w = getWallet(walletId);
+  if (!w.onboardingSpinsByBet || typeof w.onboardingSpinsByBet !== 'object') {
+    w.onboardingSpinsByBet = {};
+  }
+
+  const key = String(bet);
+  const idx = Math.max(0, Math.floor(Number(w.onboardingSpinsByBet?.[key]) || 0));
+  if (idx >= seq.length) return base;
+
+  const scripted = Number(seq[idx]);
+  w.onboardingSpinsByBet[key] = idx + 1;
+  w.updatedAt = new Date().toISOString();
+  scheduleWalletStoreSave();
+  scheduleLiabilitiesReportWrite();
+
+  return {
+    payoutAmount: Number.isFinite(scripted) ? scripted : base.payoutAmount,
+    payoutOptions: base.payoutOptions,
+    payoutWeights: base.payoutWeights
+  };
 }
 
 async function createLightningInvoice(amountSats, orderId, extraMetadata = {}) {
@@ -743,7 +778,9 @@ async function processPaidInvoice(invoiceId, opts = {}) {
   }
 
   if (!Number.isFinite(Number(round.payoutAmount))) {
-    const { payoutAmount, payoutOptions, payoutWeights } = pickPayoutAmount(round.betAmount);
+    const { payoutAmount, payoutOptions, payoutWeights } = round.walletId
+      ? pickPayoutAmountForWallet(round.walletId, round.betAmount)
+      : pickPayoutAmount(round.betAmount);
     round.payoutAmount = payoutAmount;
     round.payoutOptions = payoutOptions;
     round.payoutWeights = payoutWeights;
@@ -1015,7 +1052,7 @@ io.on('connection', (socket) => {
       const next = setWalletBalance(w.walletId, current - bet);
       socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: next });
 
-      const { payoutAmount, payoutOptions, payoutWeights } = pickPayoutAmount(bet);
+      const { payoutAmount, payoutOptions, payoutWeights } = pickPayoutAmountForWallet(w.walletId, bet);
       socket.emit('spinOutcome', {
         betAmount: bet,
         payoutAmount,
