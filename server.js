@@ -810,47 +810,72 @@ async function processPaidInvoice(invoiceId, opts = {}) {
 
   round.payoutInProgress = true;
 
-  if (payoutAmount > 0) {
-    try {
-      const payoutResp = await sendInstantPayment(
-        round.lightningAddress,
+  if (round.walletId) {
+    const prev = getWalletBalance(round.walletId);
+    const credited = payoutAmount > 0 ? setWalletBalance(round.walletId, prev + payoutAmount) : prev;
+    round.status = 'payout_sent';
+    round.payoutResponse = { creditedToWallet: true, balanceSats: credited };
+
+    if (sock) {
+      const w = getWallet(round.walletId);
+      sock.emit('walletBalance', {
+        walletId: w.walletId,
+        lightningAddress: w.lightningAddress,
+        balanceSats: credited
+      });
+
+      sock.emit('payoutSent', {
+        invoiceId,
         payoutAmount,
-        `BTC Slides payout - Invoice ${invoiceId} - ${payoutAmount} SATS`
-      );
+        recipient: 'wallet',
+        creditedToWallet: true,
+        balanceSats: credited,
+        payoutResponse: null
+      });
+    }
+  } else {
+    if (payoutAmount > 0) {
+      try {
+        const payoutResp = await sendInstantPayment(
+          round.lightningAddress,
+          payoutAmount,
+          `BTC Slides payout - Invoice ${invoiceId} - ${payoutAmount} SATS`
+        );
 
+        round.status = 'payout_sent';
+        round.payoutResponse = payoutResp;
+
+        if (sock) {
+          sock.emit('payoutSent', {
+            invoiceId,
+            payoutAmount,
+            recipient: round.lightningAddress,
+            payoutResponse: payoutResp
+          });
+        }
+      } catch (e) {
+        round.status = 'paid';
+        round.payoutError = String(e.message || e);
+
+        if (sock) {
+          sock.emit('payoutFailed', {
+            invoiceId,
+            payoutAmount,
+            recipient: round.lightningAddress,
+            error: round.payoutError
+          });
+        }
+      }
+    } else {
       round.status = 'payout_sent';
-      round.payoutResponse = payoutResp;
-
       if (sock) {
         sock.emit('payoutSent', {
           invoiceId,
-          payoutAmount,
+          payoutAmount: 0,
           recipient: round.lightningAddress,
-          payoutResponse: payoutResp
+          payoutResponse: null
         });
       }
-    } catch (e) {
-      round.status = 'paid';
-      round.payoutError = String(e.message || e);
-
-      if (sock) {
-        sock.emit('payoutFailed', {
-          invoiceId,
-          payoutAmount,
-          recipient: round.lightningAddress,
-          error: round.payoutError
-        });
-      }
-    }
-  } else {
-    round.status = 'payout_sent';
-    if (sock) {
-      sock.emit('payoutSent', {
-        invoiceId,
-        payoutAmount: 0,
-        recipient: round.lightningAddress,
-        payoutResponse: null
-      });
     }
   }
 
@@ -1060,33 +1085,18 @@ io.on('connection', (socket) => {
         payoutWeights
       });
 
-      if (payoutAmount > 0) {
-        try {
-          const payoutResp = await sendInstantPayment(
-            formattedAddress,
-            payoutAmount,
-            `BTC Slides payout - ${payoutAmount} SATS`
-          );
+      const creditedBalance = payoutAmount > 0
+        ? setWalletBalance(w.walletId, getWalletBalance(w.walletId) + payoutAmount)
+        : getWalletBalance(w.walletId);
 
-          socket.emit('payoutSent', {
-            payoutAmount,
-            recipient: formattedAddress,
-            payoutResponse: payoutResp
-          });
-        } catch (e) {
-          socket.emit('payoutFailed', {
-            payoutAmount,
-            recipient: formattedAddress,
-            error: String(e.message || e)
-          });
-        }
-      } else {
-        socket.emit('payoutSent', {
-          payoutAmount: 0,
-          recipient: formattedAddress,
-          payoutResponse: null
-        });
-      }
+      socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: creditedBalance });
+      socket.emit('payoutSent', {
+        payoutAmount,
+        recipient: 'wallet',
+        creditedToWallet: true,
+        balanceSats: creditedBalance,
+        payoutResponse: null
+      });
     } catch (error) {
       socket.emit('errorMessage', { message: error.message });
     }
@@ -1254,7 +1264,7 @@ setInterval(() => {
 const port = Number(process.env.PORT || 3001);
 
 if (!SPEED_WALLET_SECRET_KEY) {
-  console.warn('SPEED_WALLET_SECRET_KEY is not set. Payouts will fail until configured.');
+  console.warn('SPEED_WALLET_SECRET_KEY is not set. Withdrawals/auto-refunds will fail until configured.');
 }
 
 if (!SPEED_WALLET_WEBHOOK_SECRET) {
