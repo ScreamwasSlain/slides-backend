@@ -21,6 +21,8 @@ const SPEED_WALLET_PUBLISHABLE_KEY = process.env.SPEED_WALLET_PUBLISHABLE_KEY;
 const SPEED_WALLET_WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET;
 const SPEED_INVOICE_AUTH_MODE = (process.env.SPEED_INVOICE_AUTH_MODE || 'auto').toLowerCase();
 
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN ? String(process.env.ADMIN_TOKEN) : null;
+
 const AUTH_HEADER = SPEED_WALLET_SECRET_KEY
   ? Buffer.from(`${SPEED_WALLET_SECRET_KEY}:`).toString('base64')
   : null;
@@ -34,6 +36,10 @@ const TOPUP_OPTIONS = [1000, 5000, 10000];
 
 const walletsById = new Map();
 const processedInvoices = new Map();
+
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH
+  ? String(process.env.AUDIT_LOG_PATH)
+  : path.join(__dirname, 'audit_log.jsonl');
 
 const WALLET_STORE_PATH = process.env.WALLET_STORE_PATH
   ? String(process.env.WALLET_STORE_PATH)
@@ -195,6 +201,81 @@ function scheduleWalletStoreSave() {
     walletStoreSaveTimer = null;
     saveWalletStore();
   }, 600);
+}
+
+function appendAuditEvent(event) {
+  try {
+    if (!AUDIT_LOG_PATH) return;
+    const e = {
+      id: `a_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      ts: new Date().toISOString(),
+      ...event
+    };
+    const line = `${JSON.stringify(e)}\n`;
+    fs.appendFileSync(AUDIT_LOG_PATH, line, 'utf8');
+  } catch (e) {
+    console.warn(`Failed to append audit event: ${String(e.message || e)}`);
+  }
+}
+
+function isAdminRequest(req) {
+  if (!ADMIN_TOKEN) return false;
+  const h = req?.headers || {};
+  const token = String(h['x-admin-token'] || h['x_admin_token'] || req.query?.token || '').trim();
+  return token && token === ADMIN_TOKEN;
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) return res.status(500).json({ error: 'ADMIN_TOKEN not configured' });
+  if (!isAdminRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
+  return next();
+}
+
+function readAuditEvents({ walletId, type, from, to, limit, offset } = {}) {
+  const out = [];
+  try {
+    if (!AUDIT_LOG_PATH) return out;
+    if (!fs.existsSync(AUDIT_LOG_PATH)) return out;
+    const raw = fs.readFileSync(AUDIT_LOG_PATH, 'utf8');
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+
+    const fromMs = from ? Date.parse(String(from)) : NaN;
+    const toMs = to ? Date.parse(String(to)) : NaN;
+    const wFilter = walletId ? String(walletId).trim() : '';
+    const tFilter = type ? String(type).trim() : '';
+
+    const filtered = [];
+    for (const line of lines) {
+      let e;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!e || typeof e !== 'object') continue;
+      if (wFilter && String(e.walletId || '') !== wFilter) continue;
+      if (tFilter && String(e.type || '') !== tFilter) continue;
+
+      const tsMs = Date.parse(String(e.ts || ''));
+      if (Number.isFinite(fromMs) && Number.isFinite(tsMs) && tsMs < fromMs) continue;
+      if (Number.isFinite(toMs) && Number.isFinite(tsMs) && tsMs > toMs) continue;
+      filtered.push(e);
+    }
+
+    filtered.sort((a, b) => {
+      const am = Date.parse(String(a.ts || ''));
+      const bm = Date.parse(String(b.ts || ''));
+      if (Number.isFinite(am) && Number.isFinite(bm)) return bm - am;
+      return 0;
+    });
+
+    const off = Math.max(0, Math.floor(Number(offset) || 0));
+    const lim = Math.max(1, Math.min(5000, Math.floor(Number(limit) || 200)));
+    for (let i = off; i < filtered.length && out.length < lim; i += 1) out.push(filtered[i]);
+  } catch (e) {
+    console.warn(`Failed to read audit log: ${String(e.message || e)}`);
+  }
+  return out;
 }
 
 loadWalletStore();
@@ -562,6 +643,69 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, uptimeSec: Math.floor(process.uptime()), now: new Date().toISOString() });
 });
 
+app.get('/admin/audit', requireAdmin, (req, res) => {
+  const events = readAuditEvents({
+    walletId: req.query?.walletId,
+    type: req.query?.type,
+    from: req.query?.from,
+    to: req.query?.to,
+    limit: req.query?.limit,
+    offset: req.query?.offset
+  });
+  res.json({ ok: true, count: events.length, events });
+});
+
+app.get('/admin/audit.csv', requireAdmin, (req, res) => {
+  const events = readAuditEvents({
+    walletId: req.query?.walletId,
+    type: req.query?.type,
+    from: req.query?.from,
+    to: req.query?.to,
+    limit: req.query?.limit,
+    offset: req.query?.offset
+  });
+
+  const header = [
+    'ts',
+    'type',
+    'walletId',
+    'lightningAddress',
+    'invoiceId',
+    'betAmount',
+    'payoutAmount',
+    'amountSats',
+    'balanceBeforeSats',
+    'balanceAfterSats',
+    'recipient',
+    'reason',
+    'error'
+  ];
+
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const lines = [header.join(',')];
+  for (const e of events) {
+    lines.push([
+      esc(e?.ts),
+      esc(e?.type),
+      esc(e?.walletId),
+      esc(e?.lightningAddress),
+      esc(e?.invoiceId),
+      esc(e?.betAmount),
+      esc(e?.payoutAmount),
+      esc(e?.amountSats),
+      esc(e?.balanceBeforeSats),
+      esc(e?.balanceAfterSats),
+      esc(e?.recipient),
+      esc(e?.reason),
+      esc(e?.error)
+    ].join(','));
+  }
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="btc-slides-audit.csv"');
+  res.send(`${lines.join('\n')}\n`);
+});
+
 const invoiceToSocket = new Map();
 const roundsByInvoice = new Map();
 const walletToSocket = new Map();
@@ -750,6 +894,16 @@ async function processPaidInvoice(invoiceId, opts = {}) {
 
     const prev = getWalletBalance(round.walletId);
     const next = setWalletBalance(round.walletId, prev + topupAmount);
+
+    appendAuditEvent({
+      type: 'topup_credited',
+      invoiceId,
+      walletId: round.walletId,
+      lightningAddress: round.lightningAddress,
+      amountSats: topupAmount,
+      balanceBeforeSats: prev,
+      balanceAfterSats: next
+    });
 
     processedInvoices.set(invoiceId, {
       purpose: 'topup',
@@ -1086,6 +1240,15 @@ io.on('connection', (socket) => {
       const next = setWalletBalance(w.walletId, current - bet);
       socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: next });
 
+      appendAuditEvent({
+        type: 'spin_bet',
+        walletId: w.walletId,
+        lightningAddress: formattedAddress,
+        betAmount: bet,
+        balanceBeforeSats: current,
+        balanceAfterSats: next
+      });
+
       const { payoutAmount, payoutOptions, payoutWeights } = pickPayoutAmountForWallet(w.walletId, bet);
       socket.emit('spinOutcome', {
         betAmount: bet,
@@ -1105,6 +1268,17 @@ io.on('connection', (socket) => {
         creditedToWallet: true,
         balanceSats: creditedBalance,
         payoutResponse: null
+      });
+
+      appendAuditEvent({
+        type: 'spin_payout',
+        walletId: w.walletId,
+        lightningAddress: formattedAddress,
+        betAmount: bet,
+        payoutAmount,
+        balanceBeforeSats: next,
+        balanceAfterSats: creditedBalance,
+        recipient: 'wallet'
       });
     } catch (error) {
       socket.emit('errorMessage', { message: error.message });
@@ -1141,6 +1315,17 @@ io.on('connection', (socket) => {
       socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: 0 });
       socket.emit('withdrawalPending', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress });
 
+      appendAuditEvent({
+        type: 'withdraw_requested',
+        walletId: w.walletId,
+        lightningAddress: formattedAddress,
+        amountSats: amount,
+        balanceBeforeSats: amount,
+        balanceAfterSats: 0,
+        recipient: formattedAddress,
+        reason: 'manual_withdraw'
+      });
+
       try {
         const payoutResp = await sendInstantPayment(
           formattedAddress,
@@ -1162,6 +1347,17 @@ io.on('connection', (socket) => {
         scheduleLiabilitiesReportWrite();
 
         socket.emit('withdrawalSent', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress, payoutResponse: payoutResp, balanceSats: 0 });
+
+        appendAuditEvent({
+          type: 'withdraw_sent',
+          walletId: w.walletId,
+          lightningAddress: formattedAddress,
+          amountSats: amount,
+          balanceBeforeSats: amount,
+          balanceAfterSats: 0,
+          recipient: formattedAddress,
+          reason: 'manual_withdraw'
+        });
       } catch (e) {
         setWalletHold(w.walletId, 0);
         setWalletBalance(w.walletId, amount);
@@ -1172,6 +1368,18 @@ io.on('connection', (socket) => {
 
         socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: amount });
         socket.emit('withdrawalFailed', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress, error: String(e?.message || e) });
+
+        appendAuditEvent({
+          type: 'withdraw_failed',
+          walletId: w.walletId,
+          lightningAddress: formattedAddress,
+          amountSats: amount,
+          balanceBeforeSats: 0,
+          balanceAfterSats: amount,
+          recipient: formattedAddress,
+          reason: 'manual_withdraw',
+          error: String(e?.message || e)
+        });
       }
     } catch (error) {
       socket.emit('errorMessage', { message: error.message });
@@ -1223,6 +1431,17 @@ async function runAutoRefundPass() {
         scheduleWalletStoreSave();
         scheduleLiabilitiesReportWrite();
 
+        appendAuditEvent({
+          type: 'auto_refund_requested',
+          walletId,
+          lightningAddress: addr,
+          amountSats: balance,
+          balanceBeforeSats: balance,
+          balanceAfterSats: 0,
+          recipient: addr,
+          reason: 'auto_refund'
+        });
+
         const payoutResp = await sendInstantPayment(
           addr,
           balance,
@@ -1246,6 +1465,17 @@ async function runAutoRefundPass() {
           sock.emit('walletBalance', { walletId, lightningAddress: addr, balanceSats: 0 });
           sock.emit('autoRefundSent', { walletId, amountSats: balance, recipient: addr });
         }
+
+        appendAuditEvent({
+          type: 'auto_refund_sent',
+          walletId,
+          lightningAddress: addr,
+          amountSats: balance,
+          balanceBeforeSats: balance,
+          balanceAfterSats: 0,
+          recipient: addr,
+          reason: 'auto_refund'
+        });
       } catch (e) {
         setWalletHold(walletId, 0);
         setWalletBalance(walletId, balance);
@@ -1259,6 +1489,18 @@ async function runAutoRefundPass() {
           sock.emit('walletBalance', { walletId, lightningAddress: addr, balanceSats: balance });
           sock.emit('autoRefundFailed', { walletId, amountSats: balance, recipient: addr, error: String(e?.message || e) });
         }
+
+        appendAuditEvent({
+          type: 'auto_refund_failed',
+          walletId,
+          lightningAddress: addr,
+          amountSats: balance,
+          balanceBeforeSats: 0,
+          balanceAfterSats: balance,
+          recipient: addr,
+          reason: 'auto_refund',
+          error: String(e?.message || e)
+        });
       }
     }
   } finally {
