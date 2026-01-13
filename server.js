@@ -554,8 +554,12 @@ app.use(
   })
 );
 
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'btc-slides' });
+});
+
 app.get('/health', (req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, uptimeSec: Math.floor(process.uptime()), now: new Date().toISOString() });
 });
 
 const invoiceToSocket = new Map();
@@ -968,12 +972,17 @@ app.post('/webhook', express.json(), async (req, res) => {
 
 const server = http.createServer(app);
 
+server.keepAliveTimeout = 65 * 1000;
+server.headersTimeout = 70 * 1000;
+
 const io = new Server(server, {
   cors: {
     origin: corsOrigins,
     credentials: true,
     methods: ['GET', 'POST']
-  }
+  },
+  pingInterval: 25000,
+  pingTimeout: 20000
 });
 
 io.on('connection', (socket) => {
