@@ -1,0 +1,59 @@
+name: Audit Backup
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download audit CSV
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$BACKEND_URL" ]; then
+            echo "Missing BACKEND_URL secret" >&2
+            exit 1
+          fi
+          if [ -z "$ADMIN_TOKEN" ]; then
+            echo "Missing ADMIN_TOKEN secret" >&2
+            exit 1
+          fi
+
+          mkdir -p backups
+          TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+          OUT="backups/audit_${TS}.csv"
+
+          URL="${BACKEND_URL%/}/admin/audit.csv?limit=5000"
+          echo "Fetching $URL -> $OUT"
+          curl -fsS --retry 6 --retry-all-errors --retry-delay 5 --max-time 60 \
+            -H "x-admin-token: $ADMIN_TOKEN" \
+            "$URL" \
+            -o "$OUT"
+
+          cp "$OUT" backups/audit_latest.csv
+
+      - name: Commit and push if changed
+        run: |
+          set -e
+          if [ -z "$(git status --porcelain backups)" ]; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add backups/*.csv
+          git commit -m "chore(audit): backup $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
