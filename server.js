@@ -1006,7 +1006,7 @@ io.on('connection', (socket) => {
         balanceSats: getWalletBalance(w.walletId)
       });
     } catch {
-      socket.emit('walletBalance', { walletId: null, lightningAddress: null, balanceSats: 0 });
+      socket.emit('errorMessage', { message: 'Invalid wallet credentials' });
     }
   });
 
