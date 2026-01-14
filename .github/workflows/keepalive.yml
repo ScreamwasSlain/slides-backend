@@ -16,6 +16,6 @@ jobs:
       - name: Ping backend health
         run: |
           set -e
-          URL="https://slides-backend-zokf.onrender.com/health"
+          URL="https://slides-backend-zokf.onrender.com/health?src=github_cron"
           echo "Pinging $URL"
           curl -fsS --retry 6 --retry-all-errors --retry-delay 5 --max-time 20 "$URL"

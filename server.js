@@ -53,6 +53,18 @@ const LIABILITIES_REPORT_PATH = process.env.LIABILITIES_REPORT_PATH
 
 let liabilitiesReportTimer = null;
 
+ function logLine(kind, data) {
+   try {
+     const payload = {
+       kind,
+       ...(data && typeof data === 'object' ? data : { value: data })
+     };
+     if (!payload.ts) payload.ts = new Date().toISOString();
+     console.log(JSON.stringify(payload));
+   } catch {
+   }
+ }
+
 function serializeWallet(w) {
   return {
     walletId: w.walletId,
@@ -212,7 +224,12 @@ function appendAuditEvent(event) {
       ...event
     };
     const line = `${JSON.stringify(e)}\n`;
-    fs.appendFileSync(AUDIT_LOG_PATH, line, 'utf8');
+    try {
+      fs.appendFileSync(AUDIT_LOG_PATH, line, 'utf8');
+    } catch (err) {
+      console.warn(`Failed to append audit event: ${String(err?.message || err)}`);
+    }
+    logLine('audit', e);
   } catch (e) {
     console.warn(`Failed to append audit event: ${String(e.message || e)}`);
   }
@@ -640,7 +657,49 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+  try {
+    const now = Date.now();
+    if (now - lastHealthRefundKickMs > 30 * 1000) {
+      lastHealthRefundKickMs = now;
+      runAutoRefundPass().catch(() => {});
+    }
+
+    const ua = String(req.get('user-agent') || '').toLowerCase();
+    const src = String(req.query?.src || req.get('x-ping-source') || '').toLowerCase();
+    const isCronLike = Boolean(
+      src.includes('cron') ||
+      src.includes('github') ||
+      ua.includes('github-actions') ||
+      ua.includes('curl/') ||
+      ua.includes('uptimerobot')
+    );
+
+    if (isCronLike) {
+      logLine('health_ping', {
+        source: src || (ua.includes('uptimerobot') ? 'uptimerobot' : 'cron'),
+        ua: ua || null,
+        ip: String(req.ip || ''),
+        uptimeSec: Math.floor(process.uptime())
+      });
+    } else {
+      const nowMs = Date.now();
+      if (nowMs - lastHealthBrowserLogMs > 60 * 1000) {
+        lastHealthBrowserLogMs = nowMs;
+        logLine('health_ping', {
+          source: src || 'browser',
+          ua: ua || null,
+          ip: String(req.ip || ''),
+          uptimeSec: Math.floor(process.uptime())
+        });
+      }
+    }
+  } catch {
+  }
   res.json({ ok: true, uptimeSec: Math.floor(process.uptime()), now: new Date().toISOString() });
+});
+
+app.get('/webhook', (req, res) => {
+  res.json({ ok: true });
 });
 
 app.get('/admin/audit', requireAdmin, (req, res) => {
@@ -713,6 +772,13 @@ const walletToSocket = new Map();
 const AUTO_REFUND_IDLE_MS = Math.max(60 * 1000, Number(process.env.AUTO_REFUND_IDLE_MS) || 30 * 60 * 1000);
 const AUTO_REFUND_CHECK_MS = Math.max(10 * 1000, Number(process.env.AUTO_REFUND_CHECK_MS) || 60 * 1000);
 const AUTO_REFUND_COOLDOWN_MS = Math.max(10 * 1000, Number(process.env.AUTO_REFUND_COOLDOWN_MS) || 5 * 60 * 1000);
+const PENDING_WITHDRAWAL_STALE_MS = Math.max(
+  60 * 1000,
+  Number(process.env.PENDING_WITHDRAWAL_STALE_MS) || 10 * 60 * 1000
+);
+
+let lastHealthRefundKickMs = 0;
+ let lastHealthBrowserLogMs = 0;
 
 function extractInvoiceIdFromEvent(event) {
   const candidates = [
@@ -1069,59 +1135,67 @@ app.get('/verify/:invoiceId', async (req, res) => {
   }
 });
 
-app.post('/webhook', express.json(), async (req, res) => {
-  const event = req.body;
+async function handleWebhookEvent(event) {
   const eventType = event?.event_type;
+  const invoiceId = extractInvoiceIdFromEvent(event);
 
-  try {
-    const invoiceId = extractInvoiceIdFromEvent(event);
-
-    if (eventType === 'payment.failed') {
-      const invoiceId = extractInvoiceIdFromEvent(event);
-      if (invoiceId) {
-        const socketId = invoiceToSocket.get(invoiceId);
-        const sock = socketId && io.sockets.sockets.get(socketId);
-        if (sock) {
-          sock.emit('paymentFailed', {
-            invoiceId
-          });
-        }
-        invoiceToSocket.delete(invoiceId);
-        scheduleRoundCleanup(invoiceId, 5 * 60 * 1000);
-      }
-    }
-
+  if (eventType === 'payment.failed') {
     if (invoiceId) {
-      let round = roundsByInvoice.get(invoiceId);
-      if (!round) {
-        try {
-          const { details } = await verifyInvoicePaidWithSpeed(invoiceId);
-          const recovered = extractRoundFromPaymentDetails(invoiceId, details, null);
-          if (recovered) {
-            roundsByInvoice.set(invoiceId, recovered);
-            round = recovered;
-          }
-        } catch {
-        }
+      const socketId = invoiceToSocket.get(invoiceId);
+      const sock = socketId && io.sockets.sockets.get(socketId);
+      if (sock) {
+        sock.emit('paymentFailed', {
+          invoiceId
+        });
       }
-
-      if (!round) return res.status(200).send('Webhook received (unknown invoice)');
-      if (round.status === 'payout_sent' || round.status === 'credited') {
-        return res.status(200).send('Webhook received (already processed)');
-      }
-
-      const { paid, status } = await verifyInvoicePaidWithSpeed(invoiceId);
-      if (!paid) {
-        return res.status(200).send(`Webhook received (not paid yet: ${status || 'unknown'})`);
-      }
-
-      await processPaidInvoice(invoiceId, { paidVerified: true });
+      invoiceToSocket.delete(invoiceId);
+      scheduleRoundCleanup(invoiceId, 5 * 60 * 1000);
     }
-
-    res.status(200).send('Webhook received');
-  } catch (error) {
-    res.status(500).send(`Webhook processing failed: ${error.message}`);
+    return;
   }
+
+  if (!invoiceId) return;
+
+  let round = roundsByInvoice.get(invoiceId);
+  if (!round) {
+    try {
+      const { details } = await verifyInvoicePaidWithSpeed(invoiceId);
+      const recovered = extractRoundFromPaymentDetails(invoiceId, details, null);
+      if (recovered) {
+        roundsByInvoice.set(invoiceId, recovered);
+        round = recovered;
+      }
+    } catch {
+    }
+  }
+
+  if (!round) return;
+  if (round.status === 'payout_sent' || round.status === 'credited') return;
+
+  const { paid } = await verifyInvoicePaidWithSpeed(invoiceId);
+  if (!paid) return;
+
+  await processPaidInvoice(invoiceId, { paidVerified: true });
+}
+
+app.post('/webhook', express.json(), (req, res) => {
+  const event = req.body;
+  const eventType = event?.event_type || null;
+  const invoiceId = extractInvoiceIdFromEvent(event);
+  logLine('webhook_received', { eventType, invoiceId });
+  res.status(200).send('ok');
+
+  setImmediate(() => {
+    logLine('webhook_process_start', { eventType, invoiceId });
+    handleWebhookEvent(event)
+      .then(() => {
+        logLine('webhook_process_done', { eventType, invoiceId });
+      })
+      .catch((e) => {
+        logLine('webhook_process_error', { eventType, invoiceId, error: String(e?.message || e) });
+        console.warn(`Webhook processing error: ${String(e?.message || e)}`);
+      });
+  });
 });
 
 const server = http.createServer(app);
@@ -1153,7 +1227,12 @@ io.on('connection', (socket) => {
       const w = getWallet(walletId);
       if (lightningAddress) bindWalletAddress(w.walletId, lightningAddress);
       walletToSocket.set(w.walletId, socket.id);
-      noteWalletActivity(w.walletId);
+      logLine('wallet_balance', {
+        walletId: w.walletId,
+        lightningAddress: w.lightningAddress,
+        balanceSats: getWalletBalance(w.walletId),
+        socketId: socket.id
+      });
       socket.emit('walletBalance', {
         walletId: w.walletId,
         lightningAddress: w.lightningAddress,
@@ -1180,6 +1259,14 @@ io.on('connection', (socket) => {
         Wallet_ID: w.walletId,
         Lightning_Address: formattedAddress,
         Purpose: 'topup'
+      });
+
+      logLine('topup_invoice_created', {
+        walletId: w.walletId,
+        lightningAddress: formattedAddress,
+        amountSats: amount,
+        invoiceId: invoiceData?.invoiceId || null,
+        socketId: socket.id
       });
 
       const round = {
@@ -1257,6 +1344,15 @@ io.on('connection', (socket) => {
         payoutWeights
       });
 
+      logLine('spin_outcome', {
+        walletId: w.walletId,
+        lightningAddress: formattedAddress,
+        betAmount: bet,
+        payoutAmount,
+        balanceAfterBetSats: next,
+        socketId: socket.id
+      });
+
       const creditedBalance = payoutAmount > 0
         ? setWalletBalance(w.walletId, getWalletBalance(w.walletId) + payoutAmount)
         : getWalletBalance(w.walletId);
@@ -1315,6 +1411,14 @@ io.on('connection', (socket) => {
       socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: 0 });
       socket.emit('withdrawalPending', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress });
 
+      logLine('withdraw_pending', {
+        walletId: w.walletId,
+        lightningAddress: formattedAddress,
+        amountSats: amount,
+        balanceAfterSats: 0,
+        socketId: socket.id
+      });
+
       appendAuditEvent({
         type: 'withdraw_requested',
         walletId: w.walletId,
@@ -1327,6 +1431,12 @@ io.on('connection', (socket) => {
       });
 
       try {
+        logLine('withdraw_send_start', {
+          walletId: w.walletId,
+          lightningAddress: formattedAddress,
+          amountSats: amount,
+          socketId: socket.id
+        });
         const payoutResp = await sendInstantPayment(
           formattedAddress,
           amount,
@@ -1348,6 +1458,14 @@ io.on('connection', (socket) => {
 
         socket.emit('withdrawalSent', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress, payoutResponse: payoutResp, balanceSats: 0 });
 
+        logLine('withdraw_sent', {
+          walletId: w.walletId,
+          lightningAddress: formattedAddress,
+          amountSats: amount,
+          balanceAfterSats: 0,
+          socketId: socket.id
+        });
+
         appendAuditEvent({
           type: 'withdraw_sent',
           walletId: w.walletId,
@@ -1368,6 +1486,15 @@ io.on('connection', (socket) => {
 
         socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: amount });
         socket.emit('withdrawalFailed', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress, error: String(e?.message || e) });
+
+        logLine('withdraw_failed', {
+          walletId: w.walletId,
+          lightningAddress: formattedAddress,
+          amountSats: amount,
+          balanceAfterSats: amount,
+          socketId: socket.id,
+          error: String(e?.message || e)
+        });
 
         appendAuditEvent({
           type: 'withdraw_failed',
@@ -1393,9 +1520,49 @@ async function runAutoRefundPass() {
   if (autoRefundRunning) return;
   autoRefundRunning = true;
   try {
+    let revertedCount = 0;
+    let autoRefundRequestedCount = 0;
+    let autoRefundSentCount = 0;
+    let autoRefundFailedCount = 0;
     const nowMs = Date.now();
     const wallets = Array.from(walletsById.values());
     for (const w of wallets) {
+      const walletId = String(w?.walletId || '');
+      if (!walletId) continue;
+
+      const hold = Math.max(0, Number(w?.holdSats) || 0);
+      const pending = w?.pendingWithdrawal;
+      if (pending && hold > 0) {
+        const reqMs = Date.parse(String(pending?.requestedAt || ''));
+        if (Number.isFinite(reqMs) && nowMs - reqMs > PENDING_WITHDRAWAL_STALE_MS) {
+          const prevBal = Math.max(0, Number(w?.balanceSats) || 0);
+          const nextBal = setWalletBalance(walletId, prevBal + hold);
+          setWalletHold(walletId, 0);
+          w.pendingWithdrawal = null;
+          w.updatedAt = new Date().toISOString();
+          scheduleWalletStoreSave();
+          scheduleLiabilitiesReportWrite();
+
+          const sockId = walletToSocket.get(walletId);
+          const sock = sockId && io.sockets.sockets.get(sockId);
+          if (sock) {
+            sock.emit('walletBalance', { walletId, lightningAddress: w?.lightningAddress || null, balanceSats: nextBal });
+          }
+
+          appendAuditEvent({
+            type: 'pending_withdrawal_reverted',
+            walletId,
+            lightningAddress: w?.lightningAddress || null,
+            amountSats: hold,
+            balanceBeforeSats: prevBal,
+            balanceAfterSats: nextBal,
+            reason: String(pending?.reason || 'unknown')
+          });
+
+          revertedCount += 1;
+        }
+      }
+
       const balance = Math.max(0, Number(w?.balanceSats) || 0);
       if (balance <= 0) continue;
       const addr = String(w?.lightningAddress || '').trim().toLowerCase();
@@ -1414,7 +1581,7 @@ async function runAutoRefundPass() {
       scheduleWalletStoreSave();
       scheduleLiabilitiesReportWrite();
 
-      const walletId = String(w.walletId);
+      // walletId is already computed above
       const sockId = walletToSocket.get(walletId);
       const sock = sockId && io.sockets.sockets.get(sockId);
 
@@ -1441,6 +1608,8 @@ async function runAutoRefundPass() {
           recipient: addr,
           reason: 'auto_refund'
         });
+
+        autoRefundRequestedCount += 1;
 
         const payoutResp = await sendInstantPayment(
           addr,
@@ -1476,6 +1645,8 @@ async function runAutoRefundPass() {
           recipient: addr,
           reason: 'auto_refund'
         });
+
+        autoRefundSentCount += 1;
       } catch (e) {
         setWalletHold(walletId, 0);
         setWalletBalance(walletId, balance);
@@ -1501,12 +1672,25 @@ async function runAutoRefundPass() {
           reason: 'auto_refund',
           error: String(e?.message || e)
         });
+
+        autoRefundFailedCount += 1;
       }
+    }
+
+    if (revertedCount || autoRefundRequestedCount || autoRefundSentCount || autoRefundFailedCount) {
+      logLine('auto_refund_pass', {
+        revertedCount,
+        autoRefundRequestedCount,
+        autoRefundSentCount,
+        autoRefundFailedCount
+      });
     }
   } finally {
     autoRefundRunning = false;
   }
 }
+
+runAutoRefundPass().catch(() => {});
 
 setInterval(() => {
   runAutoRefundPass().catch(() => {});

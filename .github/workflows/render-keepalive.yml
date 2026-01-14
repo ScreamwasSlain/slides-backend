@@ -12,7 +12,7 @@ jobs:
       - name: Ping Render /health
         run: |
           set -e
-          URL="https://slides-backend-zokf.onrender.com/health"
+          URL="https://slides-backend-zokf.onrender.com/health?src=github_cron"
           for i in 1 2 3; do
             echo "Ping attempt $i: $URL"
             if curl -fsS --max-time 20 "$URL" > /dev/null; then
