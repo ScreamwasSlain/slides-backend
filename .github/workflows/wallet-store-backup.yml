@@ -1,0 +1,80 @@
+name: Wallet Store Backup
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch wallet store
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$BACKEND_URL" ]; then
+            echo "Missing BACKEND_URL secret" >&2
+            exit 1
+          fi
+          if [ -z "$ADMIN_TOKEN" ]; then
+            echo "Missing ADMIN_TOKEN secret" >&2
+            exit 1
+          fi
+
+          TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+          OUT_TMP="/tmp/wallet_store_${TS}.json"
+          LATEST_TMP="/tmp/wallet_store_latest.json"
+
+          URL="${BACKEND_URL%/}/admin/wallet-store.json"
+          echo "Fetching $URL -> $OUT_TMP"
+          curl -fsS --retry 6 --retry-all-errors --retry-delay 5 --max-time 60 \
+            -H "x-admin-token: $ADMIN_TOKEN" \
+            "$URL" \
+            -o "$OUT_TMP"
+
+          cp "$OUT_TMP" "$LATEST_TMP"
+
+      - name: Commit to backup branch
+        env:
+          BRANCH: wallet-store-backups
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin "$BRANCH" || true
+
+          if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout --orphan "$BRANCH"
+            git rm -rf . || true
+          fi
+
+          mkdir -p backups
+
+          TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+          cp -f /tmp/wallet_store_latest.json backups/wallet_store_latest.json
+          cp -f /tmp/wallet_store_latest.json "backups/wallet_store_${TS}.json"
+
+          git add backups/*.json
+          if [ -z "$(git status --porcelain backups)" ]; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore(wallet-store): backup $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -u origin "$BRANCH"

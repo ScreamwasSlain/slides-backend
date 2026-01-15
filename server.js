@@ -45,6 +45,14 @@ const WALLET_STORE_PATH = process.env.WALLET_STORE_PATH
   ? String(process.env.WALLET_STORE_PATH)
   : path.join(__dirname, 'wallet_store.json');
 
+const WALLET_STORE_BOOTSTRAP_URL = process.env.WALLET_STORE_BOOTSTRAP_URL
+  ? String(process.env.WALLET_STORE_BOOTSTRAP_URL)
+  : null;
+
+const WALLET_STORE_BOOTSTRAP_AUTH = process.env.WALLET_STORE_BOOTSTRAP_AUTH
+  ? String(process.env.WALLET_STORE_BOOTSTRAP_AUTH)
+  : null;
+
 let walletStoreSaveTimer = null;
 
 const LIABILITIES_REPORT_PATH = process.env.LIABILITIES_REPORT_PATH
@@ -132,6 +140,72 @@ function writeLiabilitiesReport() {
   }
 }
 
+function buildWalletStorePayload() {
+  const wallets = Array.from(walletsById.values()).map(serializeWallet);
+  const processed = Array.from(processedInvoices.entries()).map(([invoiceId, rec]) => ({
+    invoiceId,
+    purpose: rec?.purpose || null,
+    walletId: rec?.walletId || null,
+    amountSats: Number(rec?.amountSats) || 0,
+    processedAt: rec?.processedAt || null
+  }));
+  return { wallets, processedInvoices: processed };
+}
+
+async function bootstrapWalletStoreIfMissing() {
+  try {
+    if (!WALLET_STORE_BOOTSTRAP_URL) return false;
+    if (!WALLET_STORE_PATH) return false;
+
+    if (fs.existsSync(WALLET_STORE_PATH)) {
+      try {
+        const st = fs.statSync(WALLET_STORE_PATH);
+        if (st && st.size > 10) return false;
+      } catch {
+        return false;
+      }
+    }
+
+    const headers = {};
+    if (WALLET_STORE_BOOTSTRAP_AUTH) headers.Authorization = WALLET_STORE_BOOTSTRAP_AUTH;
+    if (String(WALLET_STORE_BOOTSTRAP_URL).includes('api.github.com')) {
+      headers.Accept = 'application/vnd.github.raw';
+    }
+    const resp = await axios.get(WALLET_STORE_BOOTSTRAP_URL, { timeout: 12000, headers });
+
+    let data = resp?.data;
+    if (typeof data === 'string') {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        return false;
+      }
+    }
+
+    const store = (data && typeof data === 'object' && Array.isArray(data.wallets) && Array.isArray(data.processedInvoices))
+      ? data
+      : null;
+    if (!store) return false;
+
+    const payload = JSON.stringify({
+      wallets: store.wallets,
+      processedInvoices: store.processedInvoices
+    }, null, 2);
+    const tmp = `${WALLET_STORE_PATH}.tmp`;
+    fs.writeFileSync(tmp, payload, 'utf8');
+    fs.renameSync(tmp, WALLET_STORE_PATH);
+
+    logLine('wallet_store_bootstrap_ok', {
+      walletCount: Array.isArray(store.wallets) ? store.wallets.length : 0,
+      processedInvoiceCount: Array.isArray(store.processedInvoices) ? store.processedInvoices.length : 0
+    });
+    return true;
+  } catch (e) {
+    logLine('wallet_store_bootstrap_failed', { error: String(e?.message || e) });
+    return false;
+  }
+}
+
 function scheduleLiabilitiesReportWrite() {
   if (!LIABILITIES_REPORT_PATH) return;
   if (liabilitiesReportTimer) clearTimeout(liabilitiesReportTimer);
@@ -180,6 +254,12 @@ function loadWalletStore() {
       });
     }
 
+    logLine('wallet_store_loaded', {
+      walletCount: walletsById.size,
+      processedInvoiceCount: processedInvoices.size,
+      path: WALLET_STORE_PATH
+    });
+
     scheduleLiabilitiesReportWrite();
   } catch (e) {
     console.warn(`Failed to load wallet store: ${String(e.message || e)}`);
@@ -189,15 +269,7 @@ function loadWalletStore() {
 function saveWalletStore() {
   try {
     if (!WALLET_STORE_PATH) return;
-    const wallets = Array.from(walletsById.values()).map(serializeWallet);
-    const processed = Array.from(processedInvoices.entries()).map(([invoiceId, rec]) => ({
-      invoiceId,
-      purpose: rec?.purpose || null,
-      walletId: rec?.walletId || null,
-      amountSats: Number(rec?.amountSats) || 0,
-      processedAt: rec?.processedAt || null
-    }));
-    const payload = JSON.stringify({ wallets, processedInvoices: processed }, null, 2);
+    const payload = JSON.stringify(buildWalletStorePayload(), null, 2);
     const tmp = `${WALLET_STORE_PATH}.tmp`;
     fs.writeFileSync(tmp, payload, 'utf8');
     fs.renameSync(tmp, WALLET_STORE_PATH);
@@ -294,8 +366,6 @@ function readAuditEvents({ walletId, type, from, to, limit, offset } = {}) {
   }
   return out;
 }
-
-loadWalletStore();
 
 const PAYOUT_TABLE = {
   20: [0, 20, 50, 80, 100],
@@ -700,6 +770,10 @@ app.get('/health', (req, res) => {
 
 app.get('/webhook', (req, res) => {
   res.json({ ok: true });
+});
+
+app.get('/admin/wallet-store.json', requireAdmin, (req, res) => {
+  res.json(buildWalletStorePayload());
 });
 
 app.get('/admin/audit', requireAdmin, (req, res) => {
@@ -1690,12 +1764,6 @@ async function runAutoRefundPass() {
   }
 }
 
-runAutoRefundPass().catch(() => {});
-
-setInterval(() => {
-  runAutoRefundPass().catch(() => {});
-}, AUTO_REFUND_CHECK_MS);
-
 const port = Number(process.env.PORT || 3001);
 
 if (!SPEED_WALLET_SECRET_KEY) {
@@ -1706,6 +1774,55 @@ if (!SPEED_WALLET_WEBHOOK_SECRET) {
   console.warn('SPEED_WALLET_WEBHOOK_SECRET is not set.');
 }
 
-server.listen(port, () => {
-  console.log(`BTC Slides backend listening on :${port}`);
+let shuttingDown = false;
+function beginShutdown(signal) {
+  try {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logLine('shutdown', { signal });
+    try {
+      if (walletStoreSaveTimer) {
+        clearTimeout(walletStoreSaveTimer);
+        walletStoreSaveTimer = null;
+      }
+      saveWalletStore();
+      writeLiabilitiesReport();
+    } catch {
+    }
+    try {
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 3000).unref();
+    } catch {
+      process.exit(0);
+    }
+  } catch {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => beginShutdown('SIGTERM'));
+process.on('SIGINT', () => beginShutdown('SIGINT'));
+
+async function main() {
+  await bootstrapWalletStoreIfMissing();
+  loadWalletStore();
+  runAutoRefundPass().catch(() => {});
+  setInterval(() => {
+    runAutoRefundPass().catch(() => {});
+  }, AUTO_REFUND_CHECK_MS);
+  server.listen(port, () => {
+    console.log(`BTC Slides backend listening on :${port}`);
+  });
+}
+
+main().catch((e) => {
+  console.error(String(e?.message || e));
+  loadWalletStore();
+  runAutoRefundPass().catch(() => {});
+  setInterval(() => {
+    runAutoRefundPass().catch(() => {});
+  }, AUTO_REFUND_CHECK_MS);
+  server.listen(port, () => {
+    console.log(`BTC Slides backend listening on :${port}`);
+  });
 });
