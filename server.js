@@ -843,6 +843,9 @@ const invoiceToSocket = new Map();
 const roundsByInvoice = new Map();
 const walletToSocket = new Map();
 
+const lastSpinAtByWallet = new Map();
+const SPIN_REQUEST_COOLDOWN_MS = Math.max(150, Number(process.env.SPIN_REQUEST_COOLDOWN_MS) || 500);
+
 const AUTO_REFUND_IDLE_MS = Math.max(60 * 1000, Number(process.env.AUTO_REFUND_IDLE_MS) || 30 * 60 * 1000);
 const AUTO_REFUND_CHECK_MS = Math.max(10 * 1000, Number(process.env.AUTO_REFUND_CHECK_MS) || 60 * 1000);
 const AUTO_REFUND_COOLDOWN_MS = Math.max(10 * 1000, Number(process.env.AUTO_REFUND_COOLDOWN_MS) || 5 * 60 * 1000);
@@ -1390,6 +1393,13 @@ io.on('connection', (socket) => {
       const w = bindWalletAddress(walletId, lightningAddress);
       const formattedAddress = w.lightningAddress;
 
+      const nowMs = Date.now();
+      const lastMs = Number(lastSpinAtByWallet.get(w.walletId)) || 0;
+      if (nowMs - lastMs < SPIN_REQUEST_COOLDOWN_MS) {
+        throw new Error('Spin already in progress. Please wait.');
+      }
+      lastSpinAtByWallet.set(w.walletId, nowMs);
+
       walletToSocket.set(w.walletId, socket.id);
       noteWalletActivity(w.walletId);
 
@@ -1428,8 +1438,8 @@ io.on('connection', (socket) => {
       });
 
       const creditedBalance = payoutAmount > 0
-        ? setWalletBalance(w.walletId, getWalletBalance(w.walletId) + payoutAmount)
-        : getWalletBalance(w.walletId);
+        ? setWalletBalance(w.walletId, next + payoutAmount)
+        : next;
 
       socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: creditedBalance });
       socket.emit('payoutSent', {
