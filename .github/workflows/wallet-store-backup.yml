@@ -33,13 +33,26 @@ jobs:
             exit 1
           fi
 
+          BASE="$BACKEND_URL"
+          BASE="${BASE%%\?*}"
+          BASE="${BASE%/}"
+          if [ "${BASE##*/}" = "health" ]; then
+            BASE="${BASE%/health}"
+          fi
+          BASE="${BASE%/}"
+
           TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
           OUT_TMP="/tmp/wallet_store_${TS}.json"
           LATEST_TMP="/tmp/wallet_store_latest.json"
 
-          URL="${BACKEND_URL%/}/admin/wallet-store.json"
+          URL="${BASE}/admin/wallet-store.json"
           echo "Fetching $URL -> $OUT_TMP"
-          curl -fsS --retry 6 --retry-all-errors --retry-delay 5 --max-time 60 \
+          echo "Health check: ${BASE}/health"
+          curl -fsS --retry 3 --retry-all-errors --retry-delay 3 --max-time 30 \
+            "${BASE}/health" \
+            -o /tmp/health.json || true
+
+          curl -fSs --retry 6 --retry-all-errors --retry-delay 5 --max-time 60 \
             -H "x-admin-token: $ADMIN_TOKEN" \
             "$URL" \
             -o "$OUT_TMP"
