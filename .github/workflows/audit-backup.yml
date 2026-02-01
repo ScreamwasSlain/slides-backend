@@ -47,21 +47,40 @@ jobs:
 
           URL="${BASE}/admin/audit.csv?limit=5000"
           echo "Fetching $URL -> $OUT_TMP"
-          curl -fsS --retry 6 --retry-all-errors --retry-delay 5 --max-time 60 \
+          HTTP_CODE=$(curl -sS --retry 6 --retry-all-errors --retry-delay 5 --max-time 60 \
             -H "x-admin-token: $ADMIN_TOKEN" \
-            "$URL" \
-            -o "$OUT_TMP"
+            -o "$OUT_TMP" \
+            -w "%{http_code}" \
+            "$URL" || echo "000")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Failed to fetch audit CSV. HTTP $HTTP_CODE" >&2
+            echo "Response body (if any):" >&2
+            head -c 2000 "$OUT_TMP" 2>/dev/null || true
+            echo "" >&2
+            exit 1
+          fi
 
           cp "$OUT_TMP" "$LATEST_TMP"
 
       - name: Commit to backup branch
         env:
           BRANCH: audit-backups
+          BACKUP_PUSH_TOKEN: ${{ secrets.BACKUP_PUSH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -e
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TOKEN="$BACKUP_PUSH_TOKEN"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="$GITHUB_TOKEN"
+          fi
+          if [ -n "$TOKEN" ]; then
+            git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
 
           git fetch origin "$BRANCH" || true
 
@@ -85,4 +104,9 @@ jobs:
           fi
 
           git commit -m "chore(audit): backup $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push -u origin "$BRANCH"
+          if ! git push -u origin "$BRANCH"; then
+            echo "Push failed. If this is a 403, either:" >&2
+            echo "- Set Repo Settings -> Actions -> Workflow permissions to 'Read and write', OR" >&2
+            echo "- Add a PAT as secret BACKUP_PUSH_TOKEN (repo write access)." >&2
+            exit 1
+          fi
