@@ -1,0 +1,1 @@
+ts,type,walletId,lightningAddress,invoiceId,betAmount,payoutAmount,amountSats,balanceBeforeSats,balanceAfterSats,recipient,reason,error
