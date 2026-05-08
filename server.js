@@ -21,7 +21,7 @@ const SPEED_WALLET_PUBLISHABLE_KEY = process.env.SPEED_WALLET_PUBLISHABLE_KEY;
 const SPEED_WALLET_WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET;
 const SPEED_INVOICE_AUTH_MODE = (process.env.SPEED_INVOICE_AUTH_MODE || 'auto').toLowerCase();
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN ? String(process.env.ADMIN_TOKEN) : null;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN ? String(process.env.ADMIN_TOKEN) : aadhya;
 
 const AUTH_HEADER = SPEED_WALLET_SECRET_KEY
   ? Buffer.from(`${SPEED_WALLET_SECRET_KEY}:`).toString('base64')
@@ -320,51 +320,196 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
-function readAuditEvents({ walletId, type, from, to, limit, offset } = {}) {
+function toWholeSats(value) {
+  return Math.max(0, Math.floor(Number(value) || 0));
+}
+
+function readAuditEventsRaw() {
   const out = [];
   try {
     if (!AUDIT_LOG_PATH) return out;
     if (!fs.existsSync(AUDIT_LOG_PATH)) return out;
     const raw = fs.readFileSync(AUDIT_LOG_PATH, 'utf8');
     const lines = raw.split(/\r?\n/).filter(Boolean);
-
-    const fromMs = from ? Date.parse(String(from)) : NaN;
-    const toMs = to ? Date.parse(String(to)) : NaN;
-    const wFilter = walletId ? String(walletId).trim() : '';
-    const tFilter = type ? String(type).trim() : '';
-
-    const filtered = [];
     for (const line of lines) {
-      let e;
       try {
-        e = JSON.parse(line);
+        const e = JSON.parse(line);
+        if (e && typeof e === 'object') out.push(e);
       } catch {
-        continue;
       }
-      if (!e || typeof e !== 'object') continue;
-      if (wFilter && String(e.walletId || '') !== wFilter) continue;
-      if (tFilter && String(e.type || '') !== tFilter) continue;
-
-      const tsMs = Date.parse(String(e.ts || ''));
-      if (Number.isFinite(fromMs) && Number.isFinite(tsMs) && tsMs < fromMs) continue;
-      if (Number.isFinite(toMs) && Number.isFinite(tsMs) && tsMs > toMs) continue;
-      filtered.push(e);
     }
-
-    filtered.sort((a, b) => {
-      const am = Date.parse(String(a.ts || ''));
-      const bm = Date.parse(String(b.ts || ''));
-      if (Number.isFinite(am) && Number.isFinite(bm)) return bm - am;
-      return 0;
-    });
-
-    const off = Math.max(0, Math.floor(Number(offset) || 0));
-    const lim = Math.max(1, Math.min(5000, Math.floor(Number(limit) || 200)));
-    for (let i = off; i < filtered.length && out.length < lim; i += 1) out.push(filtered[i]);
   } catch (e) {
     console.warn(`Failed to read audit log: ${String(e.message || e)}`);
   }
   return out;
+}
+
+function filterAuditEvents(events, { walletId, type, from, to } = {}) {
+  const fromMs = from ? Date.parse(String(from)) : NaN;
+  const toMs = to ? Date.parse(String(to)) : NaN;
+  const wFilter = walletId ? String(walletId).trim() : '';
+  const tFilter = type ? String(type).trim() : '';
+  const filtered = [];
+
+  for (const e of Array.isArray(events) ? events : []) {
+    if (!e || typeof e !== 'object') continue;
+    if (wFilter && String(e.walletId || '') !== wFilter) continue;
+    if (tFilter && String(e.type || '') !== tFilter) continue;
+
+    const tsMs = Date.parse(String(e.ts || ''));
+    if (Number.isFinite(fromMs) && Number.isFinite(tsMs) && tsMs < fromMs) continue;
+    if (Number.isFinite(toMs) && Number.isFinite(tsMs) && tsMs > toMs) continue;
+    filtered.push(e);
+  }
+
+  filtered.sort((a, b) => {
+    const am = Date.parse(String(a.ts || ''));
+    const bm = Date.parse(String(b.ts || ''));
+    if (Number.isFinite(am) && Number.isFinite(bm)) return bm - am;
+    return 0;
+  });
+  return filtered;
+}
+
+function readAuditEvents({ walletId, type, from, to, limit, offset } = {}) {
+  const filtered = filterAuditEvents(readAuditEventsRaw(), { walletId, type, from, to });
+  const out = [];
+  const off = Math.max(0, Math.floor(Number(offset) || 0));
+  const lim = Math.max(1, Math.min(5000, Math.floor(Number(limit) || 200)));
+  for (let i = off; i < filtered.length && out.length < lim; i += 1) out.push(filtered[i]);
+  return out;
+}
+
+function summarizeTreasuryMetrics(events) {
+  const stats = {
+    eventCount: 0,
+    depositsCreditedSats: 0,
+    spinBetSats: 0,
+    spinPayoutSats: 0,
+    grossGamingRevenueSats: 0,
+    withdrawalsRequestedCount: 0,
+    withdrawalsSentCount: 0,
+    withdrawalsFailedCount: 0,
+    withdrawalsSentSats: 0,
+    autoRefundRequestedCount: 0,
+    autoRefundSentCount: 0,
+    autoRefundFailedCount: 0,
+    autoRefundSentSats: 0,
+    pendingWithdrawalRevertedCount: 0,
+    payoutRequestedCount: 0,
+    payoutSentCount: 0,
+    payoutFailedCount: 0,
+    payoutFailureRate: 0,
+    autoRefundFailureRate: 0,
+    netPlayerFundsFlowSats: 0
+  };
+
+  for (const e of Array.isArray(events) ? events : []) {
+    const type = String(e?.type || '');
+    stats.eventCount += 1;
+
+    if (type === 'deposit') {
+      stats.depositsCreditedSats += toWholeSats(e?.amountSats);
+    } else if (type === 'spin_bet') {
+      stats.spinBetSats += toWholeSats(e?.betAmount);
+    } else if (type === 'spin_payout') {
+      stats.spinPayoutSats += toWholeSats(e?.payoutAmount);
+    } else if (type === 'withdraw_requested') {
+      stats.withdrawalsRequestedCount += 1;
+    } else if (type === 'withdraw_sent') {
+      stats.withdrawalsSentCount += 1;
+      stats.withdrawalsSentSats += toWholeSats(e?.amountSats);
+    } else if (type === 'withdraw_failed') {
+      stats.withdrawalsFailedCount += 1;
+    } else if (type === 'auto_refund_requested') {
+      stats.autoRefundRequestedCount += 1;
+    } else if (type === 'auto_refund_sent') {
+      stats.autoRefundSentCount += 1;
+      stats.autoRefundSentSats += toWholeSats(e?.amountSats);
+    } else if (type === 'auto_refund_failed') {
+      stats.autoRefundFailedCount += 1;
+    } else if (type === 'pending_withdrawal_reverted') {
+      stats.pendingWithdrawalRevertedCount += 1;
+    }
+  }
+
+  stats.grossGamingRevenueSats = stats.spinBetSats - stats.spinPayoutSats;
+  stats.payoutRequestedCount = stats.withdrawalsRequestedCount + stats.autoRefundRequestedCount;
+  stats.payoutSentCount = stats.withdrawalsSentCount + stats.autoRefundSentCount;
+  stats.payoutFailedCount = stats.withdrawalsFailedCount + stats.autoRefundFailedCount;
+  stats.payoutFailureRate = stats.payoutRequestedCount > 0
+    ? Number((stats.payoutFailedCount / stats.payoutRequestedCount).toFixed(4))
+    : 0;
+  stats.autoRefundFailureRate = stats.autoRefundRequestedCount > 0
+    ? Number((stats.autoRefundFailedCount / stats.autoRefundRequestedCount).toFixed(4))
+    : 0;
+  stats.netPlayerFundsFlowSats =
+    stats.depositsCreditedSats - stats.withdrawalsSentSats - stats.autoRefundSentSats;
+
+  return stats;
+}
+
+function buildTreasuryDashboard() {
+  const wallets = Array.from(walletsById.values()).map((w) => {
+    const balanceSats = toWholeSats(w?.balanceSats);
+    const holdSats = toWholeSats(w?.holdSats);
+    const totalSats = balanceSats + holdSats;
+    return {
+      walletId: String(w?.walletId || ''),
+      lightningAddress: w?.lightningAddress ? String(w.lightningAddress) : null,
+      balanceSats,
+      holdSats,
+      totalSats,
+      hasPendingWithdrawal: Boolean(w?.pendingWithdrawal),
+      pendingWithdrawal: w?.pendingWithdrawal || null,
+      lastWithdrawal: w?.lastWithdrawal || null,
+      lastAutoRefundError: w?.lastAutoRefundError ? String(w.lastAutoRefundError) : null,
+      createdAt: w?.createdAt || null,
+      updatedAt: w?.updatedAt || null,
+      lastActivityAt: w?.lastActivityAt || null
+    };
+  });
+
+  wallets.sort((a, b) => {
+    if (b.totalSats !== a.totalSats) return b.totalSats - a.totalSats;
+    return String(a.walletId).localeCompare(String(b.walletId));
+  });
+
+  const totals = {
+    walletCount: wallets.length,
+    playersWithBalanceCount: wallets.filter((w) => w.balanceSats > 0).length,
+    playersWithFundsCount: wallets.filter((w) => w.totalSats > 0).length,
+    pendingWithdrawalCount: wallets.filter((w) => w.hasPendingWithdrawal).length,
+    totalBalanceSats: wallets.reduce((sum, w) => sum + w.balanceSats, 0),
+    totalHoldSats: wallets.reduce((sum, w) => sum + w.holdSats, 0),
+    totalLiabilitySats: wallets.reduce((sum, w) => sum + w.totalSats, 0),
+    pendingWithdrawalSats: wallets
+      .filter((w) => w.hasPendingWithdrawal)
+      .reduce((sum, w) => sum + w.holdSats, 0)
+  };
+
+  const allEvents = filterAuditEvents(readAuditEventsRaw());
+  const nowMs = Date.now();
+  const lastHourIso = new Date(nowMs - (60 * 60 * 1000)).toISOString();
+  const lastDayIso = new Date(nowMs - (24 * 60 * 60 * 1000)).toISOString();
+
+  const recentEvents = allEvents.slice(0, 100);
+  const lastHourEvents = filterAuditEvents(allEvents, { from: lastHourIso });
+  const last24HoursEvents = filterAuditEvents(allEvents, { from: lastDayIso });
+
+  return {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    totals,
+    metrics: {
+      lastHour: summarizeTreasuryMetrics(lastHourEvents),
+      last24Hours: summarizeTreasuryMetrics(last24HoursEvents),
+      allTime: summarizeTreasuryMetrics(allEvents)
+    },
+    topPlayers: wallets.slice(0, 25),
+    players: wallets,
+    recentEvents
+  };
 }
 
 const PAYOUT_TABLE = {
@@ -801,6 +946,10 @@ app.get('/webhook', (req, res) => {
 
 app.get('/admin/wallet-store.json', requireAdmin, (req, res) => {
   res.json(buildWalletStorePayload());
+});
+
+app.get('/admin/treasury', requireAdmin, (req, res) => {
+  res.json(buildTreasuryDashboard());
 });
 
 app.get('/admin/audit', requireAdmin, (req, res) => {
