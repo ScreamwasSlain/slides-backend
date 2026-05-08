@@ -690,25 +690,52 @@ async function createLightningInvoice(amountSats, orderId, extraMetadata = {}) {
 async function sendInstantPayment(withdrawRequest, amountSats, note = '') {
   if (!AUTH_HEADER) throw new Error('Missing SPEED_WALLET_SECRET_KEY');
 
+  const isLnAddr = String(withdrawRequest || '').includes('@');
   const payload = {
-    amount: Number(amountSats),
+    amount: Math.floor(Number(amountSats)),
     currency: 'SATS',
-    target_currency: 'SATS',
     withdraw_method: 'lightning',
     withdraw_request: withdrawRequest,
-    note
+    withdraw_type: isLnAddr ? 'lightning_address' : 'lightning_invoice',
+    note: String(note || '').slice(0, 255)
   };
 
-  const resp = await axios.post(`${SPEED_WALLET_API_BASE}/send`, payload, {
-    headers: {
-      Authorization: `Basic ${AUTH_HEADER}`,
-      'Content-Type': 'application/json',
-      'speed-version': '2022-04-15'
-    },
-    timeout: 10000
-  });
+  try {
+    const resp = await axios.post(`${SPEED_WALLET_API_BASE}/send`, payload, {
+      headers: {
+        Authorization: `Basic ${AUTH_HEADER}`,
+        'Content-Type': 'application/json',
+        'speed-version': '2022-04-15'
+      },
+      timeout: 15000
+    });
+    return resp.data;
+  } catch (error) {
+    const status = error.response?.status;
+    const data = error.response?.data;
+    
+    // Speed API often returns error message in data.message or data.errors[0].message
+    let errMsg = error.message;
+    if (data) {
+      if (typeof data === 'string') {
+        errMsg = data;
+      } else if (data.message) {
+        errMsg = data.message;
+      } else if (data.errors && Array.isArray(data.errors) && data.errors[0]?.message) {
+        errMsg = data.errors[0].message;
+      } else if (data.error?.message) {
+        errMsg = data.error.message;
+      }
+    }
 
-  return resp.data;
+    console.error(`Speed Payout Error [${status || 'n/a'}]:`, {
+      message: errMsg,
+      payload,
+      response: data
+    });
+
+    throw new Error(`${errMsg}${status ? ` (Status: ${status})` : ''}`);
+  }
 }
 
 const app = express();
@@ -1610,6 +1637,16 @@ async function runAutoRefundPass() {
     let autoRefundFailedCount = 0;
     const nowMs = Date.now();
     const wallets = Array.from(walletsById.values());
+
+    const playersWithBalance = wallets.filter(w => (Number(w?.balanceSats) || 0) > 0);
+    const totalSatsInAccounts = playersWithBalance.reduce((sum, w) => sum + (Number(w?.balanceSats) || 0), 0);
+    
+    logLine('balance_stats', {
+      playerCountWithBalance: playersWithBalance.length,
+      totalSatsInAccounts,
+      totalWallets: wallets.length
+    });
+
     for (const w of wallets) {
       const walletId = String(w?.walletId || '');
       if (!walletId) continue;
