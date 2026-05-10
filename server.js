@@ -21,7 +21,7 @@ const SPEED_WALLET_PUBLISHABLE_KEY = process.env.SPEED_WALLET_PUBLISHABLE_KEY;
 const SPEED_WALLET_WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET;
 const SPEED_INVOICE_AUTH_MODE = (process.env.SPEED_INVOICE_AUTH_MODE || 'auto').toLowerCase();
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN ? String(process.env.ADMIN_TOKEN) : 'aadhya';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN ? String(process.env.ADMIN_TOKEN) : 'screamwasslain_btcslides';
 
 const AUTH_HEADER = SPEED_WALLET_SECRET_KEY
   ? Buffer.from(`${SPEED_WALLET_SECRET_KEY}:`).toString('base64')
