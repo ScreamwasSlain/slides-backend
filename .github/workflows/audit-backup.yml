@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download audit CSV
+      - name: Download audit JSONL
         env:
           BACKEND_URL: ${{ secrets.BACKEND_URL }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
@@ -42,10 +42,10 @@ jobs:
           BASE="${BASE%/}"
 
           TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-          OUT_TMP="/tmp/audit_${TS}.csv"
-          LATEST_TMP="/tmp/audit_latest.csv"
+          OUT_TMP="/tmp/audit_${TS}.jsonl"
+          LATEST_TMP="/tmp/audit_latest.jsonl"
 
-          URL="${BASE}/admin/audit.csv?limit=5000"
+          URL="${BASE}/admin/audit.jsonl"
           echo "Fetching $URL -> $OUT_TMP"
           HTTP_CODE=$(curl -sS --retry 6 --retry-all-errors --retry-delay 5 --max-time 60 \
             -H "x-admin-token: $ADMIN_TOKEN" \
@@ -54,7 +54,7 @@ jobs:
             "$URL" || echo "000")
 
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "Failed to fetch audit CSV. HTTP $HTTP_CODE" >&2
+            echo "Failed to fetch audit JSONL. HTTP $HTTP_CODE" >&2
             echo "Response body (if any):" >&2
             head -c 2000 "$OUT_TMP" 2>/dev/null || true
             echo "" >&2
@@ -94,10 +94,10 @@ jobs:
           mkdir -p backups
 
           TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
-          cp -f /tmp/audit_latest.csv backups/audit_latest.csv
-          cp -f /tmp/audit_latest.csv "backups/audit_${TS}.csv"
+          cp -f /tmp/audit_latest.jsonl backups/audit_latest.jsonl
+          cp -f /tmp/audit_latest.jsonl "backups/audit_${TS}.jsonl"
 
-          git add backups/*.csv
+          git add backups/*.jsonl
           if [ -z "$(git status --porcelain backups)" ]; then
             echo "No changes to commit"
             exit 0

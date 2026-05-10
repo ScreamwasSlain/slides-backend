@@ -37,27 +37,77 @@ const TOPUP_OPTIONS = [1000, 5000, 10000];
 const walletsById = new Map();
 const processedInvoices = new Map();
 
-const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH
-  ? String(process.env.AUDIT_LOG_PATH)
-  : path.join(__dirname, 'audit_log.jsonl');
+function detectPersistentDataDir() {
+  const candidates = [
+    process.env.DATA_DIR,
+    process.env.PERSISTENT_DATA_DIR,
+    process.env.RENDER_DISK_PATH,
+    process.env.RENDER_DISK_MOUNT_PATH,
+    process.env.RENDER_DISK_ROOT
+  ].map((v) => String(v || '').trim()).filter(Boolean);
 
-const WALLET_STORE_PATH = process.env.WALLET_STORE_PATH
-  ? String(process.env.WALLET_STORE_PATH)
-  : path.join(__dirname, 'wallet_store.json');
+  for (const c of candidates) {
+    try {
+      fs.mkdirSync(c, { recursive: true });
+      return c;
+    } catch {
+    }
+  }
+  return null;
+}
+
+function ensureParentDir(filePath) {
+  try {
+    const dir = path.dirname(String(filePath || ''));
+    if (dir) fs.mkdirSync(dir, { recursive: true });
+  } catch {
+  }
+}
+
+function resolveDataFilePath(explicitPath, fallbackFileName) {
+  if (explicitPath) return String(explicitPath);
+  const dataDir = detectPersistentDataDir();
+  if (dataDir) return path.join(dataDir, fallbackFileName);
+  return path.join(__dirname, fallbackFileName);
+}
+
+function deriveDefaultGithubRawUrl(branch, fileName) {
+  const explicitRepo = String(process.env.BACKUP_GITHUB_REPOSITORY || '').trim();
+  const repoFromRender = String(process.env.RENDER_GIT_REPO_URL || '').trim();
+  let repo = explicitRepo;
+
+  if (!repo && repoFromRender) {
+    const m = repoFromRender.match(/github\.com[:/](.+?)(?:\.git)?$/i);
+    if (m && m[1]) repo = m[1];
+  }
+
+  if (!repo || !branch || !fileName) return null;
+  return `https://raw.githubusercontent.com/${repo}/${branch}/backups/${fileName}`;
+}
+
+const AUDIT_LOG_PATH = resolveDataFilePath(process.env.AUDIT_LOG_PATH, 'audit_log.jsonl');
+
+const WALLET_STORE_PATH = resolveDataFilePath(process.env.WALLET_STORE_PATH, 'wallet_store.json');
 
 const WALLET_STORE_BOOTSTRAP_URL = process.env.WALLET_STORE_BOOTSTRAP_URL
   ? String(process.env.WALLET_STORE_BOOTSTRAP_URL)
-  : null;
+  : deriveDefaultGithubRawUrl('wallet-store-backups', 'wallet_store_latest.json');
 
 const WALLET_STORE_BOOTSTRAP_AUTH = process.env.WALLET_STORE_BOOTSTRAP_AUTH
   ? String(process.env.WALLET_STORE_BOOTSTRAP_AUTH)
   : null;
 
+const AUDIT_LOG_BOOTSTRAP_URL = process.env.AUDIT_LOG_BOOTSTRAP_URL
+  ? String(process.env.AUDIT_LOG_BOOTSTRAP_URL)
+  : deriveDefaultGithubRawUrl('audit-backups', 'audit_latest.jsonl');
+
+const AUDIT_LOG_BOOTSTRAP_AUTH = process.env.AUDIT_LOG_BOOTSTRAP_AUTH
+  ? String(process.env.AUDIT_LOG_BOOTSTRAP_AUTH)
+  : null;
+
 let walletStoreSaveTimer = null;
 
-const LIABILITIES_REPORT_PATH = process.env.LIABILITIES_REPORT_PATH
-  ? String(process.env.LIABILITIES_REPORT_PATH)
-  : path.join(__dirname, 'wallet_liabilities.csv');
+const LIABILITIES_REPORT_PATH = resolveDataFilePath(process.env.LIABILITIES_REPORT_PATH, 'wallet_liabilities.csv');
 
 let liabilitiesReportTimer = null;
 
@@ -93,6 +143,7 @@ function serializeWallet(w) {
 
 function writeLiabilitiesReport() {
   try {
+    ensureParentDir(LIABILITIES_REPORT_PATH);
     const rows = [];
     rows.push('walletId,lightningAddress,balanceSats,holdSats,totalSats,lastActivityAt,updatedAt,pendingWithdrawalId,pendingReason');
 
@@ -152,28 +203,34 @@ function buildWalletStorePayload() {
   return { wallets, processedInvoices: processed };
 }
 
+function isMissingOrTiny(filePath, minBytes = 10) {
+  try {
+    if (!filePath) return true;
+    if (!fs.existsSync(filePath)) return true;
+    const st = fs.statSync(filePath);
+    return !st || st.size < minBytes;
+  } catch {
+    return true;
+  }
+}
+
+async function fetchBootstrapData(url, authHeaderValue = null) {
+  const headers = {};
+  if (authHeaderValue) headers.Authorization = authHeaderValue;
+  if (String(url).includes('api.github.com')) {
+    headers.Accept = 'application/vnd.github.raw';
+  }
+  const resp = await axios.get(url, { timeout: 12000, headers });
+  return resp?.data;
+}
+
 async function bootstrapWalletStoreIfMissing() {
   try {
     if (!WALLET_STORE_BOOTSTRAP_URL) return false;
     if (!WALLET_STORE_PATH) return false;
+    if (!isMissingOrTiny(WALLET_STORE_PATH)) return false;
 
-    if (fs.existsSync(WALLET_STORE_PATH)) {
-      try {
-        const st = fs.statSync(WALLET_STORE_PATH);
-        if (st && st.size > 10) return false;
-      } catch {
-        return false;
-      }
-    }
-
-    const headers = {};
-    if (WALLET_STORE_BOOTSTRAP_AUTH) headers.Authorization = WALLET_STORE_BOOTSTRAP_AUTH;
-    if (String(WALLET_STORE_BOOTSTRAP_URL).includes('api.github.com')) {
-      headers.Accept = 'application/vnd.github.raw';
-    }
-    const resp = await axios.get(WALLET_STORE_BOOTSTRAP_URL, { timeout: 12000, headers });
-
-    let data = resp?.data;
+    let data = await fetchBootstrapData(WALLET_STORE_BOOTSTRAP_URL, WALLET_STORE_BOOTSTRAP_AUTH);
     if (typeof data === 'string') {
       try {
         data = JSON.parse(data);
@@ -191,6 +248,7 @@ async function bootstrapWalletStoreIfMissing() {
       wallets: store.wallets,
       processedInvoices: store.processedInvoices
     }, null, 2);
+    ensureParentDir(WALLET_STORE_PATH);
     const tmp = `${WALLET_STORE_PATH}.tmp`;
     fs.writeFileSync(tmp, payload, 'utf8');
     fs.renameSync(tmp, WALLET_STORE_PATH);
@@ -202,6 +260,135 @@ async function bootstrapWalletStoreIfMissing() {
     return true;
   } catch (e) {
     logLine('wallet_store_bootstrap_failed', { error: String(e?.message || e) });
+    return false;
+  }
+}
+
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function csvToAuditJsonl(csvText) {
+  const rawLines = String(csvText || '').split(/\r?\n/).filter(Boolean);
+  if (rawLines.length < 2) return '';
+
+  const header = parseCsvLine(rawLines[0]).map((s) => String(s || '').trim());
+  const idx = Object.fromEntries(header.map((h, i) => [h, i]));
+  const mustHave = ['ts', 'type'];
+  for (const key of mustHave) {
+    if (!Number.isInteger(idx[key])) return '';
+  }
+
+  const lines = [];
+  for (let i = 1; i < rawLines.length; i += 1) {
+    const cols = parseCsvLine(rawLines[i]);
+    const get = (k) => {
+      const p = idx[k];
+      if (!Number.isInteger(p)) return null;
+      const v = cols[p];
+      if (v == null || v === '') return null;
+      return v;
+    };
+    const num = (k) => {
+      const v = get(k);
+      if (v == null) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const e = {
+      id: `boot_${Date.now()}_${i}`,
+      ts: get('ts') || new Date().toISOString(),
+      type: get('type') || 'unknown',
+      walletId: get('walletId'),
+      lightningAddress: get('lightningAddress'),
+      invoiceId: get('invoiceId'),
+      betAmount: num('betAmount'),
+      payoutAmount: num('payoutAmount'),
+      amountSats: num('amountSats'),
+      balanceBeforeSats: num('balanceBeforeSats'),
+      balanceAfterSats: num('balanceAfterSats'),
+      recipient: get('recipient'),
+      reason: get('reason'),
+      error: get('error')
+    };
+    lines.push(JSON.stringify(e));
+  }
+  return lines.length ? `${lines.join('\n')}\n` : '';
+}
+
+async function bootstrapAuditLogIfMissing() {
+  try {
+    if (!AUDIT_LOG_BOOTSTRAP_URL) return false;
+    if (!AUDIT_LOG_PATH) return false;
+    if (!isMissingOrTiny(AUDIT_LOG_PATH, 20)) return false;
+
+    const data = await fetchBootstrapData(AUDIT_LOG_BOOTSTRAP_URL, AUDIT_LOG_BOOTSTRAP_AUTH);
+    let text = '';
+    if (typeof data === 'string') {
+      const s = data.trim();
+      if (!s) return false;
+      if (s[0] === '{' || s[0] === '[') {
+        try {
+          const parsed = JSON.parse(s);
+          if (Array.isArray(parsed)) {
+            text = parsed.map((x) => JSON.stringify(x)).join('\n');
+            if (text) text += '\n';
+          } else {
+            text = `${JSON.stringify(parsed)}\n`;
+          }
+        } catch {
+          if (s.includes(',') && s.toLowerCase().includes('ts') && s.toLowerCase().includes('type')) {
+            text = csvToAuditJsonl(s);
+          } else {
+            text = s.endsWith('\n') ? s : `${s}\n`;
+          }
+        }
+      } else if (s.includes(',') && s.toLowerCase().includes('ts') && s.toLowerCase().includes('type')) {
+        text = csvToAuditJsonl(s);
+      } else {
+        text = s.endsWith('\n') ? s : `${s}\n`;
+      }
+    } else if (Array.isArray(data)) {
+      text = data.map((x) => JSON.stringify(x)).join('\n');
+      if (text) text += '\n';
+    } else if (data && typeof data === 'object') {
+      text = `${JSON.stringify(data)}\n`;
+    }
+
+    if (!text || text.trim().length < 2) return false;
+    ensureParentDir(AUDIT_LOG_PATH);
+    const tmp = `${AUDIT_LOG_PATH}.tmp`;
+    fs.writeFileSync(tmp, text, 'utf8');
+    fs.renameSync(tmp, AUDIT_LOG_PATH);
+
+    logLine('audit_log_bootstrap_ok', {
+      path: AUDIT_LOG_PATH,
+      bytes: Buffer.byteLength(text, 'utf8')
+    });
+    return true;
+  } catch (e) {
+    logLine('audit_log_bootstrap_failed', { error: String(e?.message || e) });
     return false;
   }
 }
@@ -269,6 +456,7 @@ function loadWalletStore() {
 function saveWalletStore() {
   try {
     if (!WALLET_STORE_PATH) return;
+    ensureParentDir(WALLET_STORE_PATH);
     const payload = JSON.stringify(buildWalletStorePayload(), null, 2);
     const tmp = `${WALLET_STORE_PATH}.tmp`;
     fs.writeFileSync(tmp, payload, 'utf8');
@@ -297,6 +485,7 @@ function appendAuditEvent(event) {
     };
     const line = `${JSON.stringify(e)}\n`;
     try {
+      ensureParentDir(AUDIT_LOG_PATH);
       fs.appendFileSync(AUDIT_LOG_PATH, line, 'utf8');
     } catch (err) {
       console.warn(`Failed to append audit event: ${String(err?.message || err)}`);
@@ -1057,6 +1246,20 @@ app.get('/admin/audit', requireAdmin, (req, res) => {
     offset: req.query?.offset
   });
   res.json({ ok: true, count: events.length, events });
+});
+
+app.get('/admin/audit.jsonl', requireAdmin, (req, res) => {
+  try {
+    if (!AUDIT_LOG_PATH || !fs.existsSync(AUDIT_LOG_PATH)) {
+      res.setHeader('Content-Type', 'application/x-ndjson');
+      return res.send('');
+    }
+    const raw = fs.readFileSync(AUDIT_LOG_PATH, 'utf8');
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    return res.send(raw);
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 app.get('/admin/audit.csv', requireAdmin, (req, res) => {
@@ -2096,6 +2299,7 @@ process.on('SIGINT', () => beginShutdown('SIGINT'));
 
 async function main() {
   await bootstrapWalletStoreIfMissing();
+  await bootstrapAuditLogIfMissing();
   loadWalletStore();
   runAutoRefundPass().catch(() => {});
   setInterval(() => {
