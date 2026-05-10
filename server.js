@@ -21,7 +21,7 @@ const SPEED_WALLET_PUBLISHABLE_KEY = process.env.SPEED_WALLET_PUBLISHABLE_KEY;
 const SPEED_WALLET_WEBHOOK_SECRET = process.env.SPEED_WALLET_WEBHOOK_SECRET;
 const SPEED_INVOICE_AUTH_MODE = (process.env.SPEED_INVOICE_AUTH_MODE || 'auto').toLowerCase();
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN ? String(process.env.ADMIN_TOKEN) : aadhya;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN ? String(process.env.ADMIN_TOKEN) : 'aadhya';
 
 const AUTH_HEADER = SPEED_WALLET_SECRET_KEY
   ? Buffer.from(`${SPEED_WALLET_SECRET_KEY}:`).toString('base64')
@@ -450,7 +450,82 @@ function summarizeTreasuryMetrics(events) {
 }
 
 function buildTreasuryDashboard() {
+  const allEvents = filterAuditEvents(readAuditEventsRaw());
+  const statsByWallet = new Map();
+
+  function ensureWalletStats(walletId) {
+    const id = String(walletId || '').trim();
+    if (!id) return null;
+    if (!statsByWallet.has(id)) {
+      statsByWallet.set(id, {
+        walletId: id,
+        depositCount: 0,
+        depositsCreditedSats: 0,
+        spinsMade: 0,
+        totalBetSats: 0,
+        totalPayoutSats: 0,
+        gameplayNetSats: 0,
+        withdrawalsRequestedCount: 0,
+        withdrawalsSentCount: 0,
+        withdrawalsFailedCount: 0,
+        withdrawalsSentSats: 0,
+        autoRefundRequestedCount: 0,
+        autoRefundSentCount: 0,
+        autoRefundFailedCount: 0,
+        autoRefundSentSats: 0,
+        payoutOutSats: 0,
+        lastPlayedAt: null,
+        lastDepositAt: null,
+        lastWithdrawAt: null,
+        lastRefundAt: null
+      });
+    }
+    return statsByWallet.get(id);
+  }
+
+  for (const e of allEvents) {
+    const walletStats = ensureWalletStats(e?.walletId);
+    if (!walletStats) continue;
+    const type = String(e?.type || '');
+    const ts = e?.ts || null;
+
+    if (type === 'deposit') {
+      walletStats.depositCount += 1;
+      walletStats.depositsCreditedSats += toWholeSats(e?.amountSats);
+      walletStats.lastDepositAt = ts || walletStats.lastDepositAt;
+    } else if (type === 'spin_bet') {
+      walletStats.spinsMade += 1;
+      walletStats.totalBetSats += toWholeSats(e?.betAmount);
+      walletStats.lastPlayedAt = ts || walletStats.lastPlayedAt;
+    } else if (type === 'spin_payout') {
+      walletStats.totalPayoutSats += toWholeSats(e?.payoutAmount);
+      walletStats.lastPlayedAt = ts || walletStats.lastPlayedAt;
+    } else if (type === 'withdraw_requested') {
+      walletStats.withdrawalsRequestedCount += 1;
+    } else if (type === 'withdraw_sent') {
+      walletStats.withdrawalsSentCount += 1;
+      walletStats.withdrawalsSentSats += toWholeSats(e?.amountSats);
+      walletStats.lastWithdrawAt = ts || walletStats.lastWithdrawAt;
+    } else if (type === 'withdraw_failed') {
+      walletStats.withdrawalsFailedCount += 1;
+    } else if (type === 'auto_refund_requested') {
+      walletStats.autoRefundRequestedCount += 1;
+    } else if (type === 'auto_refund_sent') {
+      walletStats.autoRefundSentCount += 1;
+      walletStats.autoRefundSentSats += toWholeSats(e?.amountSats);
+      walletStats.lastRefundAt = ts || walletStats.lastRefundAt;
+    } else if (type === 'auto_refund_failed') {
+      walletStats.autoRefundFailedCount += 1;
+    }
+  }
+
+  for (const stats of statsByWallet.values()) {
+    stats.gameplayNetSats = stats.totalBetSats - stats.totalPayoutSats;
+    stats.payoutOutSats = stats.withdrawalsSentSats + stats.autoRefundSentSats;
+  }
+
   const wallets = Array.from(walletsById.values()).map((w) => {
+    const walletStats = ensureWalletStats(w?.walletId) || {};
     const balanceSats = toWholeSats(w?.balanceSats);
     const holdSats = toWholeSats(w?.holdSats);
     const totalSats = balanceSats + holdSats;
@@ -466,7 +541,28 @@ function buildTreasuryDashboard() {
       lastAutoRefundError: w?.lastAutoRefundError ? String(w.lastAutoRefundError) : null,
       createdAt: w?.createdAt || null,
       updatedAt: w?.updatedAt || null,
-      lastActivityAt: w?.lastActivityAt || null
+      lastActivityAt: w?.lastActivityAt || null,
+      stats: {
+        depositCount: Number(walletStats.depositCount) || 0,
+        depositsCreditedSats: Number(walletStats.depositsCreditedSats) || 0,
+        spinsMade: Number(walletStats.spinsMade) || 0,
+        totalBetSats: Number(walletStats.totalBetSats) || 0,
+        totalPayoutSats: Number(walletStats.totalPayoutSats) || 0,
+        gameplayNetSats: Number(walletStats.gameplayNetSats) || 0,
+        withdrawalsRequestedCount: Number(walletStats.withdrawalsRequestedCount) || 0,
+        withdrawalsSentCount: Number(walletStats.withdrawalsSentCount) || 0,
+        withdrawalsFailedCount: Number(walletStats.withdrawalsFailedCount) || 0,
+        withdrawalsSentSats: Number(walletStats.withdrawalsSentSats) || 0,
+        autoRefundRequestedCount: Number(walletStats.autoRefundRequestedCount) || 0,
+        autoRefundSentCount: Number(walletStats.autoRefundSentCount) || 0,
+        autoRefundFailedCount: Number(walletStats.autoRefundFailedCount) || 0,
+        autoRefundSentSats: Number(walletStats.autoRefundSentSats) || 0,
+        payoutOutSats: Number(walletStats.payoutOutSats) || 0,
+        lastPlayedAt: walletStats.lastPlayedAt || null,
+        lastDepositAt: walletStats.lastDepositAt || null,
+        lastWithdrawAt: walletStats.lastWithdrawAt || null,
+        lastRefundAt: walletStats.lastRefundAt || null
+      }
     };
   });
 
@@ -488,7 +584,6 @@ function buildTreasuryDashboard() {
       .reduce((sum, w) => sum + w.holdSats, 0)
   };
 
-  const allEvents = filterAuditEvents(readAuditEventsRaw());
   const nowMs = Date.now();
   const lastHourIso = new Date(nowMs - (60 * 60 * 1000)).toISOString();
   const lastDayIso = new Date(nowMs - (24 * 60 * 60 * 1000)).toISOString();
