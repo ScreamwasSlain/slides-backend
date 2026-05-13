@@ -134,11 +134,25 @@ function serializeWallet(w) {
     lastActivityAt: w.lastActivityAt || null,
     boundAt: w.boundAt || null,
     secretSetAt: w.secretSetAt || null,
-    pendingWithdrawal: w.pendingWithdrawal || null,
-    lastWithdrawal: w.lastWithdrawal || null,
+    pendingWithdrawal: sanitizePendingWithdrawal(w.pendingWithdrawal),
+    lastWithdrawal: sanitizeWithdrawalRecord(w.lastWithdrawal),
     onboardingSpinsByBet: w.onboardingSpinsByBet && typeof w.onboardingSpinsByBet === 'object' ? w.onboardingSpinsByBet : null,
     walletSecretHash: Buffer.isBuffer(w.walletSecretHash) ? w.walletSecretHash.toString('hex') : (w.walletSecretHash || null)
   };
+}
+
+function sanitizePendingWithdrawal(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  const reason = String(rec?.reason || '').trim();
+  return {
+    ...rec,
+    reason: reason === 'manual_withdraw' ? reason : null
+  };
+}
+
+function sanitizeWithdrawalRecord(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  return String(rec?.reason || '').trim() === 'manual_withdraw' ? rec : null;
 }
 
 function writeLiabilitiesReport() {
@@ -423,8 +437,8 @@ function loadWalletStore() {
         lastActivityAt: item?.lastActivityAt || null,
         boundAt: item?.boundAt || null,
         secretSetAt: item?.secretSetAt || null,
-        pendingWithdrawal: item?.pendingWithdrawal || null,
-        lastWithdrawal: item?.lastWithdrawal || null,
+        pendingWithdrawal: sanitizePendingWithdrawal(item?.pendingWithdrawal),
+        lastWithdrawal: sanitizeWithdrawalRecord(item?.lastWithdrawal),
         onboardingSpinsByBet: item?.onboardingSpinsByBet && typeof item.onboardingSpinsByBet === 'object' ? item.onboardingSpinsByBet : null,
         walletSecretHash: item?.walletSecretHash || null
       });
@@ -538,12 +552,23 @@ function filterAuditEvents(events, { walletId, type, from, to } = {}) {
   const toMs = to ? Date.parse(String(to)) : NaN;
   const wFilter = walletId ? String(walletId).trim() : '';
   const tFilter = type ? String(type).trim() : '';
+  const visibleTypes = new Set([
+    'deposit',
+    'spin_bet',
+    'spin_payout',
+    'withdraw_requested',
+    'withdraw_sent',
+    'withdraw_failed',
+    'pending_withdrawal_reverted'
+  ]);
   const filtered = [];
 
   for (const e of Array.isArray(events) ? events : []) {
     if (!e || typeof e !== 'object') continue;
+    const eventType = String(e?.type || '').trim();
+    if (!visibleTypes.has(eventType)) continue;
     if (wFilter && String(e.walletId || '') !== wFilter) continue;
-    if (tFilter && String(e.type || '') !== tFilter) continue;
+    if (tFilter && eventType !== tFilter) continue;
 
     const tsMs = Date.parse(String(e.ts || ''));
     if (Number.isFinite(fromMs) && Number.isFinite(tsMs) && tsMs < fromMs) continue;
@@ -580,16 +605,11 @@ function summarizeTreasuryMetrics(events) {
     withdrawalsSentCount: 0,
     withdrawalsFailedCount: 0,
     withdrawalsSentSats: 0,
-    autoRefundRequestedCount: 0,
-    autoRefundSentCount: 0,
-    autoRefundFailedCount: 0,
-    autoRefundSentSats: 0,
     pendingWithdrawalRevertedCount: 0,
     payoutRequestedCount: 0,
     payoutSentCount: 0,
     payoutFailedCount: 0,
     payoutFailureRate: 0,
-    autoRefundFailureRate: 0,
     netPlayerFundsFlowSats: 0
   };
 
@@ -610,30 +630,19 @@ function summarizeTreasuryMetrics(events) {
       stats.withdrawalsSentSats += toWholeSats(e?.amountSats);
     } else if (type === 'withdraw_failed') {
       stats.withdrawalsFailedCount += 1;
-    } else if (type === 'auto_refund_requested') {
-      stats.autoRefundRequestedCount += 1;
-    } else if (type === 'auto_refund_sent') {
-      stats.autoRefundSentCount += 1;
-      stats.autoRefundSentSats += toWholeSats(e?.amountSats);
-    } else if (type === 'auto_refund_failed') {
-      stats.autoRefundFailedCount += 1;
     } else if (type === 'pending_withdrawal_reverted') {
       stats.pendingWithdrawalRevertedCount += 1;
     }
   }
 
   stats.grossGamingRevenueSats = stats.spinBetSats - stats.spinPayoutSats;
-  stats.payoutRequestedCount = stats.withdrawalsRequestedCount + stats.autoRefundRequestedCount;
-  stats.payoutSentCount = stats.withdrawalsSentCount + stats.autoRefundSentCount;
-  stats.payoutFailedCount = stats.withdrawalsFailedCount + stats.autoRefundFailedCount;
+  stats.payoutRequestedCount = stats.withdrawalsRequestedCount;
+  stats.payoutSentCount = stats.withdrawalsSentCount;
+  stats.payoutFailedCount = stats.withdrawalsFailedCount;
   stats.payoutFailureRate = stats.payoutRequestedCount > 0
     ? Number((stats.payoutFailedCount / stats.payoutRequestedCount).toFixed(4))
     : 0;
-  stats.autoRefundFailureRate = stats.autoRefundRequestedCount > 0
-    ? Number((stats.autoRefundFailedCount / stats.autoRefundRequestedCount).toFixed(4))
-    : 0;
-  stats.netPlayerFundsFlowSats =
-    stats.depositsCreditedSats - stats.withdrawalsSentSats - stats.autoRefundSentSats;
+  stats.netPlayerFundsFlowSats = stats.depositsCreditedSats - stats.withdrawalsSentSats;
 
   return stats;
 }
@@ -658,15 +667,10 @@ function buildTreasuryDashboard() {
         withdrawalsSentCount: 0,
         withdrawalsFailedCount: 0,
         withdrawalsSentSats: 0,
-        autoRefundRequestedCount: 0,
-        autoRefundSentCount: 0,
-        autoRefundFailedCount: 0,
-        autoRefundSentSats: 0,
         payoutOutSats: 0,
         lastPlayedAt: null,
         lastDepositAt: null,
-        lastWithdrawAt: null,
-        lastRefundAt: null
+        lastWithdrawAt: null
       });
     }
     return statsByWallet.get(id);
@@ -697,20 +701,12 @@ function buildTreasuryDashboard() {
       walletStats.lastWithdrawAt = ts || walletStats.lastWithdrawAt;
     } else if (type === 'withdraw_failed') {
       walletStats.withdrawalsFailedCount += 1;
-    } else if (type === 'auto_refund_requested') {
-      walletStats.autoRefundRequestedCount += 1;
-    } else if (type === 'auto_refund_sent') {
-      walletStats.autoRefundSentCount += 1;
-      walletStats.autoRefundSentSats += toWholeSats(e?.amountSats);
-      walletStats.lastRefundAt = ts || walletStats.lastRefundAt;
-    } else if (type === 'auto_refund_failed') {
-      walletStats.autoRefundFailedCount += 1;
     }
   }
 
   for (const stats of statsByWallet.values()) {
     stats.gameplayNetSats = stats.totalBetSats - stats.totalPayoutSats;
-    stats.payoutOutSats = stats.withdrawalsSentSats + stats.autoRefundSentSats;
+    stats.payoutOutSats = stats.withdrawalsSentSats;
   }
 
   const wallets = Array.from(walletsById.values()).map((w) => {
@@ -725,9 +721,8 @@ function buildTreasuryDashboard() {
       holdSats,
       totalSats,
       hasPendingWithdrawal: Boolean(w?.pendingWithdrawal),
-      pendingWithdrawal: w?.pendingWithdrawal || null,
-      lastWithdrawal: w?.lastWithdrawal || null,
-      lastAutoRefundError: w?.lastAutoRefundError ? String(w.lastAutoRefundError) : null,
+      pendingWithdrawal: sanitizePendingWithdrawal(w?.pendingWithdrawal),
+      lastWithdrawal: sanitizeWithdrawalRecord(w?.lastWithdrawal),
       createdAt: w?.createdAt || null,
       updatedAt: w?.updatedAt || null,
       lastActivityAt: w?.lastActivityAt || null,
@@ -742,15 +737,10 @@ function buildTreasuryDashboard() {
         withdrawalsSentCount: Number(walletStats.withdrawalsSentCount) || 0,
         withdrawalsFailedCount: Number(walletStats.withdrawalsFailedCount) || 0,
         withdrawalsSentSats: Number(walletStats.withdrawalsSentSats) || 0,
-        autoRefundRequestedCount: Number(walletStats.autoRefundRequestedCount) || 0,
-        autoRefundSentCount: Number(walletStats.autoRefundSentCount) || 0,
-        autoRefundFailedCount: Number(walletStats.autoRefundFailedCount) || 0,
-        autoRefundSentSats: Number(walletStats.autoRefundSentSats) || 0,
         payoutOutSats: Number(walletStats.payoutOutSats) || 0,
         lastPlayedAt: walletStats.lastPlayedAt || null,
         lastDepositAt: walletStats.lastDepositAt || null,
-        lastWithdrawAt: walletStats.lastWithdrawAt || null,
-        lastRefundAt: walletStats.lastRefundAt || null
+        lastWithdrawAt: walletStats.lastWithdrawAt || null
       }
     };
   });
@@ -1184,12 +1174,6 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   try {
-    const now = Date.now();
-    if (now - lastHealthRefundKickMs > 30 * 1000) {
-      lastHealthRefundKickMs = now;
-      runAutoRefundPass().catch(() => {});
-    }
-
     const ua = String(req.get('user-agent') || '').toLowerCase();
     const src = String(req.query?.src || req.get('x-ping-source') || '').toLowerCase();
     const isCronLike = Boolean(
@@ -1320,16 +1304,12 @@ const walletToSocket = new Map();
 const lastSpinAtByWallet = new Map();
 const SPIN_REQUEST_COOLDOWN_MS = Math.max(150, Number(process.env.SPIN_REQUEST_COOLDOWN_MS) || 500);
 
-const AUTO_REFUND_IDLE_MS = Math.max(60 * 1000, Number(process.env.AUTO_REFUND_IDLE_MS) || 30 * 60 * 1000);
-const AUTO_REFUND_CHECK_MS = Math.max(10 * 1000, Number(process.env.AUTO_REFUND_CHECK_MS) || 60 * 1000);
-const AUTO_REFUND_COOLDOWN_MS = Math.max(10 * 1000, Number(process.env.AUTO_REFUND_COOLDOWN_MS) || 5 * 60 * 1000);
 const PENDING_WITHDRAWAL_STALE_MS = Math.max(
   60 * 1000,
   Number(process.env.PENDING_WITHDRAWAL_STALE_MS) || 10 * 60 * 1000
 );
 
-let lastHealthRefundKickMs = 0;
- let lastHealthBrowserLogMs = 0;
+let lastHealthBrowserLogMs = 0;
 
 function extractInvoiceIdFromEvent(event) {
   const candidates = [
@@ -2072,16 +2052,13 @@ io.on('connection', (socket) => {
   });
 });
 
-let autoRefundRunning = false;
+let pendingWithdrawalsSweepRunning = false;
 
-async function runAutoRefundPass() {
-  if (autoRefundRunning) return;
-  autoRefundRunning = true;
+async function runPendingWithdrawalSweep() {
+  if (pendingWithdrawalsSweepRunning) return;
+  pendingWithdrawalsSweepRunning = true;
   try {
     let revertedCount = 0;
-    let autoRefundRequestedCount = 0;
-    let autoRefundSentCount = 0;
-    let autoRefundFailedCount = 0;
     const nowMs = Date.now();
     const wallets = Array.from(walletsById.values());
 
@@ -2130,138 +2107,20 @@ async function runAutoRefundPass() {
           revertedCount += 1;
         }
       }
-
-      const balance = Math.max(0, Number(w?.balanceSats) || 0);
-      if (balance <= 0) continue;
-      const addr = String(w?.lightningAddress || '').trim().toLowerCase();
-      if (!addr || !addr.includes('@')) continue;
-      if (w?.pendingWithdrawal) continue;
-
-      const lastActMs = Date.parse(String(w?.lastActivityAt || ''));
-      if (!Number.isFinite(lastActMs)) continue;
-      if (nowMs - lastActMs < AUTO_REFUND_IDLE_MS) continue;
-
-      const lastTryMs = Date.parse(String(w?.lastAutoRefundAttemptAt || ''));
-      if (Number.isFinite(lastTryMs) && nowMs - lastTryMs < AUTO_REFUND_COOLDOWN_MS) continue;
-
-      w.lastAutoRefundAttemptAt = new Date().toISOString();
-      w.updatedAt = w.lastAutoRefundAttemptAt;
-      scheduleWalletStoreSave();
-      scheduleLiabilitiesReportWrite();
-
-      // walletId is already computed above
-      const sockId = walletToSocket.get(walletId);
-      const sock = sockId && io.sockets.sockets.get(sockId);
-
-      try {
-        setWalletBalance(walletId, 0);
-        setWalletHold(walletId, balance);
-        w.pendingWithdrawal = {
-          withdrawalId: `auto_${Date.now()}_${walletId.slice(0, 6)}`,
-          amountSats: balance,
-          requestedAt: new Date().toISOString(),
-          reason: 'auto_refund'
-        };
-        w.updatedAt = new Date().toISOString();
-        scheduleWalletStoreSave();
-        scheduleLiabilitiesReportWrite();
-
-        appendAuditEvent({
-          type: 'auto_refund_requested',
-          walletId,
-          lightningAddress: addr,
-          amountSats: balance,
-          balanceBeforeSats: balance,
-          balanceAfterSats: 0,
-          recipient: addr,
-          reason: 'auto_refund'
-        });
-
-        autoRefundRequestedCount += 1;
-
-        const payoutResp = await sendInstantPayment(
-          addr,
-          balance,
-          `BTC Slides auto-refund - ${balance} SATS`
-        );
-
-        setWalletHold(walletId, 0);
-        w.pendingWithdrawal = null;
-        w.lastWithdrawal = {
-          amountSats: balance,
-          recipient: addr,
-          sentAt: new Date().toISOString(),
-          reason: 'auto_refund',
-          payoutResponse: payoutResp
-        };
-        w.updatedAt = new Date().toISOString();
-        scheduleWalletStoreSave();
-        scheduleLiabilitiesReportWrite();
-
-        if (sock) {
-          sock.emit('walletBalance', { walletId, lightningAddress: addr, balanceSats: 0 });
-          sock.emit('autoRefundSent', { walletId, amountSats: balance, recipient: addr });
-        }
-
-        appendAuditEvent({
-          type: 'auto_refund_sent',
-          walletId,
-          lightningAddress: addr,
-          amountSats: balance,
-          balanceBeforeSats: balance,
-          balanceAfterSats: 0,
-          recipient: addr,
-          reason: 'auto_refund'
-        });
-
-        autoRefundSentCount += 1;
-      } catch (e) {
-        setWalletHold(walletId, 0);
-        setWalletBalance(walletId, balance);
-        w.pendingWithdrawal = null;
-        w.lastAutoRefundError = String(e?.message || e);
-        w.updatedAt = new Date().toISOString();
-        scheduleWalletStoreSave();
-        scheduleLiabilitiesReportWrite();
-
-        if (sock) {
-          sock.emit('walletBalance', { walletId, lightningAddress: addr, balanceSats: balance });
-          sock.emit('autoRefundFailed', { walletId, amountSats: balance, recipient: addr, error: String(e?.message || e) });
-        }
-
-        appendAuditEvent({
-          type: 'auto_refund_failed',
-          walletId,
-          lightningAddress: addr,
-          amountSats: balance,
-          balanceBeforeSats: 0,
-          balanceAfterSats: balance,
-          recipient: addr,
-          reason: 'auto_refund',
-          error: String(e?.message || e)
-        });
-
-        autoRefundFailedCount += 1;
-      }
     }
 
-    if (revertedCount || autoRefundRequestedCount || autoRefundSentCount || autoRefundFailedCount) {
-      logLine('auto_refund_pass', {
-        revertedCount,
-        autoRefundRequestedCount,
-        autoRefundSentCount,
-        autoRefundFailedCount
-      });
+    if (revertedCount) {
+      logLine('pending_withdrawal_sweep', { revertedCount });
     }
   } finally {
-    autoRefundRunning = false;
+    pendingWithdrawalsSweepRunning = false;
   }
 }
 
 const port = Number(process.env.PORT || 3001);
 
 if (!SPEED_WALLET_SECRET_KEY) {
-  console.warn('SPEED_WALLET_SECRET_KEY is not set. Withdrawals/auto-refunds will fail until configured.');
+  console.warn('SPEED_WALLET_SECRET_KEY is not set. Withdrawals will fail until configured.');
 }
 
 if (!SPEED_WALLET_WEBHOOK_SECRET) {
@@ -2301,10 +2160,10 @@ async function main() {
   await bootstrapWalletStoreIfMissing();
   await bootstrapAuditLogIfMissing();
   loadWalletStore();
-  runAutoRefundPass().catch(() => {});
+  runPendingWithdrawalSweep().catch(() => {});
   setInterval(() => {
-    runAutoRefundPass().catch(() => {});
-  }, AUTO_REFUND_CHECK_MS);
+    runPendingWithdrawalSweep().catch(() => {});
+  }, 60 * 1000);
   server.listen(port, () => {
     console.log(`BTC Slides backend listening on :${port}`);
   });
@@ -2313,10 +2172,10 @@ async function main() {
 main().catch((e) => {
   console.error(String(e?.message || e));
   loadWalletStore();
-  runAutoRefundPass().catch(() => {});
+  runPendingWithdrawalSweep().catch(() => {});
   setInterval(() => {
-    runAutoRefundPass().catch(() => {});
-  }, AUTO_REFUND_CHECK_MS);
+    runPendingWithdrawalSweep().catch(() => {});
+  }, 60 * 1000);
   server.listen(port, () => {
     console.log(`BTC Slides backend listening on :${port}`);
   });

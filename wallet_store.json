@@ -1,0 +1,35 @@
+{
+  "wallets": [
+    {
+      "walletId": "8fc294b8a9e8d31c2ee8749e60b8ba6e",
+      "balanceSats": 0,
+      "holdSats": 0,
+      "lightningAddress": null,
+      "createdAt": "2026-05-13T14:17:27.714Z",
+      "updatedAt": null,
+      "lastActivityAt": "2026-05-13T14:17:27.714Z",
+      "boundAt": null,
+      "secretSetAt": "2026-05-13T14:17:27.714Z",
+      "pendingWithdrawal": null,
+      "lastWithdrawal": null,
+      "onboardingSpinsByBet": null,
+      "walletSecretHash": "6056cf7db734e68d42ccab5497b596b9546cb83b117c48dfe97fd4779f24c9d1"
+    },
+    {
+      "walletId": "6a8e2debc4d17e15f9dffd43f1cec7ca",
+      "balanceSats": 0,
+      "holdSats": 0,
+      "lightningAddress": "bonebreaker@speed.app",
+      "createdAt": "2026-05-13T14:17:40.748Z",
+      "updatedAt": "2026-05-13T14:18:15.769Z",
+      "lastActivityAt": "2026-05-13T14:18:15.769Z",
+      "boundAt": "2026-05-13T14:18:02.163Z",
+      "secretSetAt": "2026-05-13T14:17:40.748Z",
+      "pendingWithdrawal": null,
+      "lastWithdrawal": null,
+      "onboardingSpinsByBet": null,
+      "walletSecretHash": "a7f4634142028803b100f6aa481440c6c57e1f7c6162d55771789a9f109f428d"
+    }
+  ],
+  "processedInvoices": []
+}
