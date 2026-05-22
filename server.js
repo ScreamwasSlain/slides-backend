@@ -819,19 +819,19 @@ const PAYOUT_WEIGHTS = {
 };
 
 // Bonus-mode scripted sequences are split by bankroll band:
-// - starter: a little friendlier so the first spins feel alive
-// - hover: encourages the promo bankroll to linger around the middle
-// - high: gets harsher after 100+ SATS so the bankroll fades back down
+// - starter: front-loads a few stronger early hits while staying cap-safe
+// - hover: keeps a steadier mid-range with mixed small wins and misses
+// - high: tapers off more clearly after 100+ SATS so the bankroll fades down
 const REWARD_BONUS_SCRIPTED_PAYOUTS_BY_BET = {
   20: {
-    starter: [20, 20, 10, 30, 20, 10, 20, 40, 10, 20, 30, 0, 20, 10, 50, 20, 10, 20, 30, 0, 40, 20, 10, 20],
-    hover: [10, 20, 0, 20, 10, 30, 0, 20, 10, 20, 0, 40, 10, 20, 0, 30, 10, 20, 0, 50, 10, 20, 0, 30],
-    high: [0, 10, 0, 20, 0, 10, 20, 0, 0, 30, 10, 0, 20, 0, 10, 0, 40, 0, 10, 20, 0, 0, 30, 0]
+    starter: [50, 80, 20, 50, 0, 50, 20, 20, 50, 80, 0, 0, 20, 80, 20, 50, 20, 20, 0, 50, 20, 80, 20, 20],
+    hover: [20, 50, 20, 0, 20, 50, 20, 20, 0, 50, 20, 80, 20, 0, 20, 50, 20, 20, 0, 50, 20, 20, 0, 50],
+    high: [0, 20, 0, 20, 0, 50, 0, 20, 0, 20, 0, 50, 20, 0, 20, 0, 0, 20, 0, 50, 0, 20, 0, 0]
   },
   100: {
-    starter: [100, 120, 100, 80, 100, 150, 80, 100, 120, 50, 100, 120],
-    hover: [80, 100, 50, 100, 120, 80, 100, 50, 120, 80, 100, 0],
-    high: [50, 0, 80, 50, 0, 100, 50, 0, 80, 0, 50, 100]
+    starter: [120, 120, 0, 50, 100, 50, 120, 50, 120, 0, 50, 50],
+    hover: [50, 120, 50, 120, 50, 50, 120, 0, 50, 120, 50, 0],
+    high: [50, 0, 50, 0, 50, 120, 0, 50, 0, 50, 0, 0]
   },
   300: [],
   500: [],
@@ -1187,6 +1187,7 @@ function pickPayoutAmountForWallet(walletId, betAmount) {
 function pickRewardBonusPayoutAmountForWallet(walletId, betAmount) {
   const bet = Number(betAmount);
   const base = pickPayoutAmountForWallet(walletId, bet);
+  const normalPayoutOptions = Array.isArray(base?.payoutOptions) ? base.payoutOptions : (PAYOUT_TABLE?.[bet] || [0, bet]);
   const rewardBonusBalanceAfterBet = getRewardBonusBalance(walletId);
   const { band, sequence: seq } = getRewardBonusSequenceForBet(bet, rewardBonusBalanceAfterBet);
   if (!Array.isArray(seq) || seq.length === 0) return { ...base, rewardBonusOddsActive: false };
@@ -1200,7 +1201,15 @@ function pickRewardBonusPayoutAmountForWallet(walletId, betAmount) {
   const idx = Math.max(0, Math.floor(Number(w.rewardBonusSpinsByBet?.[key]) || 0));
   const scripted = Number(seq[idx % seq.length]);
   const maxAllowedPayout = Math.max(0, MAX_REWARD_BONUS_BANKROLL_SATS - rewardBonusBalanceAfterBet);
-  const cappedScripted = Math.max(0, Math.min(maxAllowedPayout, Number.isFinite(scripted) ? scripted : 0));
+  const allowedPayouts = Array.from(new Set(
+    normalPayoutOptions
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n) && n >= 0 && n <= maxAllowedPayout)
+  )).sort((a, b) => a - b);
+  const scriptedOrZero = Number.isFinite(scripted) ? scripted : 0;
+  const cappedScripted = allowedPayouts.length
+    ? allowedPayouts.reduce((best, value) => (value <= scriptedOrZero ? value : best), allowedPayouts[0])
+    : 0;
   w.rewardBonusSpinsByBet[key] = idx + 1;
   w.updatedAt = new Date().toISOString();
   scheduleWalletStoreSave();
