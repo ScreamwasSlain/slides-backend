@@ -43,6 +43,7 @@ const REWARD_BONUS_WAGER_LIMIT_SATS_BY_BET = {
 
 const walletsById = new Map();
 const processedInvoices = new Map();
+const rewardedLightningAddresses = new Set();
 
 function detectPersistentDataDir() {
   const candidates = [
@@ -227,7 +228,8 @@ function buildWalletStorePayload() {
     amountSats: Number(rec?.amountSats) || 0,
     processedAt: rec?.processedAt || null
   }));
-  return { wallets, processedInvoices: processed };
+  const rewardedAddresses = Array.from(rewardedLightningAddresses.values()).sort();
+  return { wallets, processedInvoices: processed, rewardedLightningAddresses: rewardedAddresses };
 }
 
 function isMissingOrTiny(filePath, minBytes = 10) {
@@ -437,9 +439,12 @@ function loadWalletStore() {
     const parsed = JSON.parse(raw);
     const arr = Array.isArray(parsed?.wallets) ? parsed.wallets : [];
     const processed = Array.isArray(parsed?.processedInvoices) ? parsed.processedInvoices : [];
+    const rewardedAddresses = Array.isArray(parsed?.rewardedLightningAddresses) ? parsed.rewardedLightningAddresses : [];
+    rewardedLightningAddresses.clear();
     for (const item of arr) {
       const id = String(item?.walletId || '').trim();
       if (!id) continue;
+      const rewardClaimedAddress = item?.rewardClaimedAddress ? String(item.rewardClaimedAddress) : null;
       walletsById.set(id, {
         walletId: id,
         balanceSats: Math.max(0, Math.floor(Number(item?.balanceSats) || 0)),
@@ -453,7 +458,7 @@ function loadWalletStore() {
         boundAt: item?.boundAt || null,
         secretSetAt: item?.secretSetAt || null,
         rewardClaimedAt: item?.rewardClaimedAt || null,
-        rewardClaimedAddress: item?.rewardClaimedAddress ? String(item.rewardClaimedAddress) : null,
+        rewardClaimedAddress: rewardClaimedAddress,
         rewardBonusDeactivatedAt: item?.rewardBonusDeactivatedAt || null,
         pendingWithdrawal: sanitizePendingWithdrawal(item?.pendingWithdrawal),
         lastWithdrawal: sanitizeWithdrawalRecord(item?.lastWithdrawal),
@@ -461,6 +466,9 @@ function loadWalletStore() {
         rewardBonusSpinsByBet: item?.rewardBonusSpinsByBet && typeof item.rewardBonusSpinsByBet === 'object' ? item.rewardBonusSpinsByBet : null,
         walletSecretHash: item?.walletSecretHash || null
       });
+      if (item?.rewardClaimedAt && rewardClaimedAddress) {
+        rewardedLightningAddresses.add(formatLightningAddress(rewardClaimedAddress));
+      }
     }
 
     for (const p of processed) {
@@ -472,6 +480,13 @@ function loadWalletStore() {
         amountSats: Number(p?.amountSats) || 0,
         processedAt: p?.processedAt || null
       });
+    }
+
+    for (const addr of rewardedAddresses) {
+      try {
+        rewardedLightningAddresses.add(formatLightningAddress(addr));
+      } catch {
+      }
     }
 
     logLine('wallet_store_loaded', {
@@ -1077,6 +1092,7 @@ function buildWalletBalancePayload(walletId) {
 
 function hasRewardClaimForLightningAddress(lightningAddress, excludeWalletId = null) {
   const addr = formatLightningAddress(lightningAddress);
+  if (rewardedLightningAddresses.has(addr)) return true;
   const excludeId = excludeWalletId ? formatWalletId(excludeWalletId) : null;
   for (const wallet of walletsById.values()) {
     if (!wallet?.rewardClaimedAt) continue;
@@ -1123,6 +1139,7 @@ function maybeGrantNewUserReward(walletId) {
 
   w.rewardClaimedAt = new Date().toISOString();
   w.rewardClaimedAddress = w.lightningAddress;
+  rewardedLightningAddresses.add(formatLightningAddress(w.lightningAddress));
   w.rewardBonusDeactivatedAt = null;
   w.rewardBonusWageredSats = 0;
   w.rewardBonusSpinsByBet = {};
