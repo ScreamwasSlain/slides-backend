@@ -821,7 +821,7 @@ const PAYOUT_WEIGHTS = {
 // Bonus-mode scripted sequences are split by bankroll band:
 // - starter: front-loads a few stronger early hits while staying cap-safe
 // - hover: keeps a steadier mid-range with mixed small wins and misses
-// - high: tapers off more clearly after 100+ SATS so the bankroll fades down
+// - high: tapers off more clearly once the post-bet bonus bankroll is in its top range
 const REWARD_BONUS_SCRIPTED_PAYOUTS_BY_BET = {
   20: {
     starter: [50, 80, 20, 50, 0, 50, 20, 20, 50, 80, 0, 0, 20, 80, 20, 50, 20, 20, 0, 50, 20, 80, 20, 20],
@@ -843,6 +843,12 @@ const REWARD_BONUS_SCRIPTED_PAYOUTS_BY_BET = {
 const ONBOARDING_PAYOUTS_BY_BET = {
   20: [50, 20, 50, 0, 0, 80],
   100: [120, 120, 50, 0, 50, 0]
+};
+
+const REWARD_BONUS_BAND_THRESHOLDS_BY_BET = {
+  default: { hoverMin: 60, highMin: 100 },
+  20: { hoverMin: 60, highMin: 100 },
+  100: { hoverMin: 20, highMin: 40 }
 };
 
 function pickWeighted(options, weights) {
@@ -1136,10 +1142,14 @@ function buildRewardBonusPayoutTable() {
   return out;
 }
 
-function getRewardBonusBand(balanceAfterBetSats) {
+function getRewardBonusBand(betAmount, balanceAfterBetSats) {
+  const bet = Number(betAmount);
   const balance = Math.max(0, Math.floor(Number(balanceAfterBetSats) || 0));
-  if (balance >= 100) return 'high';
-  if (balance >= 60) return 'hover';
+  const thresholds = REWARD_BONUS_BAND_THRESHOLDS_BY_BET?.[bet] || REWARD_BONUS_BAND_THRESHOLDS_BY_BET.default;
+  const hoverMin = Math.max(0, Math.floor(Number(thresholds?.hoverMin) || 0));
+  const highMin = Math.max(hoverMin, Math.floor(Number(thresholds?.highMin) || 0));
+  if (balance >= highMin) return 'high';
+  if (balance >= hoverMin) return 'hover';
   return 'starter';
 }
 
@@ -1148,7 +1158,7 @@ function getRewardBonusSequenceForBet(betAmount, balanceAfterBetSats) {
   if (Array.isArray(config)) return { band: 'default', sequence: config };
   if (!config || typeof config !== 'object') return { band: 'default', sequence: [] };
 
-  const band = getRewardBonusBand(balanceAfterBetSats);
+  const band = getRewardBonusBand(betAmount, balanceAfterBetSats);
   const preferred = Array.isArray(config?.[band]) ? config[band] : [];
   if (preferred.length) return { band, sequence: preferred };
 
