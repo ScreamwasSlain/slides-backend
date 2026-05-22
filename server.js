@@ -35,6 +35,11 @@ const BET_OPTIONS = [20, 100, 300, 500, 1000, 5000, 10000];
 const TOPUP_OPTIONS = [1000, 5000, 10000];
 const NEW_USER_REWARD_SATS = 50;
 const MAX_REWARD_BONUS_BANKROLL_SATS = 150;
+const REWARD_BONUS_WAGER_LIMIT_SATS_BY_BET = {
+  default: 300,
+  20: 300,
+  100: 500
+};
 
 const walletsById = new Map();
 const processedInvoices = new Map();
@@ -131,6 +136,7 @@ function serializeWallet(w) {
     balanceSats: Number(w.balanceSats) || 0,
     holdSats: Number(w.holdSats) || 0,
     rewardBonusBalanceSats: Number(w.rewardBonusBalanceSats) || 0,
+    rewardBonusWageredSats: Number(w.rewardBonusWageredSats) || 0,
     lightningAddress: w.lightningAddress || null,
     createdAt: w.createdAt || null,
     updatedAt: w.updatedAt || null,
@@ -439,6 +445,7 @@ function loadWalletStore() {
         balanceSats: Math.max(0, Math.floor(Number(item?.balanceSats) || 0)),
         holdSats: Math.max(0, Math.floor(Number(item?.holdSats) || 0)),
         rewardBonusBalanceSats: Math.max(0, Math.floor(Number(item?.rewardBonusBalanceSats) || 0)),
+        rewardBonusWageredSats: Math.max(0, Math.floor(Number(item?.rewardBonusWageredSats) || 0)),
         lightningAddress: item?.lightningAddress ? String(item.lightningAddress) : null,
         createdAt: item?.createdAt || null,
         updatedAt: item?.updatedAt || null,
@@ -940,6 +947,7 @@ function getWallet(walletId) {
     balanceSats: 0,
     holdSats: 0,
     rewardBonusBalanceSats: 0,
+    rewardBonusWageredSats: 0,
     lightningAddress: null,
     rewardClaimedAt: null,
     rewardClaimedAddress: null,
@@ -1019,6 +1027,27 @@ function setRewardBonusBalance(walletId, rewardBonusBalanceSats) {
   return next;
 }
 
+function getRewardBonusWagered(walletId) {
+  const w = getWallet(walletId);
+  return Math.max(0, Number(w.rewardBonusWageredSats) || 0);
+}
+
+function setRewardBonusWagered(walletId, rewardBonusWageredSats) {
+  const w = getWallet(walletId);
+  const next = Math.max(0, Math.floor(Number(rewardBonusWageredSats) || 0));
+  w.rewardBonusWageredSats = next;
+  w.updatedAt = new Date().toISOString();
+  scheduleWalletStoreSave();
+  scheduleLiabilitiesReportWrite();
+  return next;
+}
+
+function getRewardBonusWagerLimitForBet(betAmount) {
+  const bet = Number(betAmount);
+  const limit = REWARD_BONUS_WAGER_LIMIT_SATS_BY_BET?.[bet] ?? REWARD_BONUS_WAGER_LIMIT_SATS_BY_BET.default;
+  return Math.max(0, Math.floor(Number(limit) || 0));
+}
+
 function isRewardBonusOddsActive(wallet) {
   const w = wallet && typeof wallet === 'object' ? wallet : getWallet(wallet);
   return !w.rewardBonusDeactivatedAt && (Number(w.rewardBonusBalanceSats) || 0) > 0;
@@ -1030,6 +1059,7 @@ function buildRewardBonusState(walletId) {
     rewardClaimedAt: w.rewardClaimedAt || null,
     rewardClaimedAddress: w.rewardClaimedAddress || null,
     rewardBonusBalanceSats: getRewardBonusBalance(w.walletId),
+    rewardBonusWageredSats: getRewardBonusWagered(w.walletId),
     rewardBonusOddsActive: isRewardBonusOddsActive(w),
     rewardBonusDeactivatedAt: w.rewardBonusDeactivatedAt || null
   };
@@ -1094,6 +1124,7 @@ function maybeGrantNewUserReward(walletId) {
   w.rewardClaimedAt = new Date().toISOString();
   w.rewardClaimedAddress = w.lightningAddress;
   w.rewardBonusDeactivatedAt = null;
+  w.rewardBonusWageredSats = 0;
   w.rewardBonusSpinsByBet = {};
   w.updatedAt = new Date().toISOString();
   scheduleWalletStoreSave();
@@ -2112,8 +2143,15 @@ io.on('connection', (socket) => {
       const next = setWalletBalance(w.walletId, current - bet);
       const rewardBonusActiveBeforeSpin = isRewardBonusOddsActive(w);
       const rewardBonusBalanceBeforeSpin = getRewardBonusBalance(w.walletId);
+      let rewardBonusActiveForPayout = rewardBonusActiveBeforeSpin;
       if (rewardBonusActiveBeforeSpin) {
         setRewardBonusBalance(w.walletId, Math.max(0, rewardBonusBalanceBeforeSpin - bet));
+        const nextRewardBonusWagered = setRewardBonusWagered(w.walletId, getRewardBonusWagered(w.walletId) + bet);
+        const rewardBonusWagerLimit = getRewardBonusWagerLimitForBet(bet);
+        if (rewardBonusWagerLimit > 0 && nextRewardBonusWagered >= rewardBonusWagerLimit) {
+          disableRewardBonusForWallet(w.walletId, 'wager_limit_reached');
+          rewardBonusActiveForPayout = false;
+        }
       }
       socket.emit('walletBalance', buildWalletBalancePayload(w.walletId));
 
@@ -2126,7 +2164,7 @@ io.on('connection', (socket) => {
         balanceAfterSats: next
       });
 
-      const { payoutAmount, payoutOptions, payoutWeights, rewardBonusOddsActive } = rewardBonusActiveBeforeSpin
+      const { payoutAmount, payoutOptions, payoutWeights, rewardBonusOddsActive } = rewardBonusActiveForPayout
         ? pickRewardBonusPayoutAmountForWallet(w.walletId, bet)
         : pickPayoutAmountForWallet(w.walletId, bet);
       socket.emit('spinOutcome', {
@@ -2134,7 +2172,7 @@ io.on('connection', (socket) => {
         payoutAmount,
         payoutOptions,
         payoutWeights,
-        rewardBonusOddsActive: Boolean(rewardBonusActiveBeforeSpin && rewardBonusOddsActive !== false)
+        rewardBonusOddsActive: Boolean(rewardBonusActiveForPayout && rewardBonusOddsActive !== false)
       });
 
       logLine('spin_outcome', {
@@ -2149,7 +2187,7 @@ io.on('connection', (socket) => {
       const creditedBalance = payoutAmount > 0
         ? setWalletBalance(w.walletId, next + payoutAmount)
         : next;
-      if (rewardBonusActiveBeforeSpin && payoutAmount > 0) {
+      if (rewardBonusActiveForPayout && payoutAmount > 0) {
         setRewardBonusBalance(w.walletId, getRewardBonusBalance(w.walletId) + payoutAmount);
       }
 
