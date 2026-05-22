@@ -33,6 +33,8 @@ const PUB_AUTH_HEADER = SPEED_WALLET_PUBLISHABLE_KEY
 
 const BET_OPTIONS = [20, 100, 300, 500, 1000, 5000, 10000];
 const TOPUP_OPTIONS = [1000, 5000, 10000];
+const NEW_USER_REWARD_SATS = 50;
+const MAX_REWARD_BONUS_BANKROLL_SATS = 150;
 
 const walletsById = new Map();
 const processedInvoices = new Map();
@@ -128,15 +130,20 @@ function serializeWallet(w) {
     walletId: w.walletId,
     balanceSats: Number(w.balanceSats) || 0,
     holdSats: Number(w.holdSats) || 0,
+    rewardBonusBalanceSats: Number(w.rewardBonusBalanceSats) || 0,
     lightningAddress: w.lightningAddress || null,
     createdAt: w.createdAt || null,
     updatedAt: w.updatedAt || null,
     lastActivityAt: w.lastActivityAt || null,
     boundAt: w.boundAt || null,
     secretSetAt: w.secretSetAt || null,
+    rewardClaimedAt: w.rewardClaimedAt || null,
+    rewardClaimedAddress: w.rewardClaimedAddress || null,
+    rewardBonusDeactivatedAt: w.rewardBonusDeactivatedAt || null,
     pendingWithdrawal: sanitizePendingWithdrawal(w.pendingWithdrawal),
     lastWithdrawal: sanitizeWithdrawalRecord(w.lastWithdrawal),
     onboardingSpinsByBet: w.onboardingSpinsByBet && typeof w.onboardingSpinsByBet === 'object' ? w.onboardingSpinsByBet : null,
+    rewardBonusSpinsByBet: w.rewardBonusSpinsByBet && typeof w.rewardBonusSpinsByBet === 'object' ? w.rewardBonusSpinsByBet : null,
     walletSecretHash: Buffer.isBuffer(w.walletSecretHash) ? w.walletSecretHash.toString('hex') : (w.walletSecretHash || null)
   };
 }
@@ -431,15 +438,20 @@ function loadWalletStore() {
         walletId: id,
         balanceSats: Math.max(0, Math.floor(Number(item?.balanceSats) || 0)),
         holdSats: Math.max(0, Math.floor(Number(item?.holdSats) || 0)),
+        rewardBonusBalanceSats: Math.max(0, Math.floor(Number(item?.rewardBonusBalanceSats) || 0)),
         lightningAddress: item?.lightningAddress ? String(item.lightningAddress) : null,
         createdAt: item?.createdAt || null,
         updatedAt: item?.updatedAt || null,
         lastActivityAt: item?.lastActivityAt || null,
         boundAt: item?.boundAt || null,
         secretSetAt: item?.secretSetAt || null,
+        rewardClaimedAt: item?.rewardClaimedAt || null,
+        rewardClaimedAddress: item?.rewardClaimedAddress ? String(item.rewardClaimedAddress) : null,
+        rewardBonusDeactivatedAt: item?.rewardBonusDeactivatedAt || null,
         pendingWithdrawal: sanitizePendingWithdrawal(item?.pendingWithdrawal),
         lastWithdrawal: sanitizeWithdrawalRecord(item?.lastWithdrawal),
         onboardingSpinsByBet: item?.onboardingSpinsByBet && typeof item.onboardingSpinsByBet === 'object' ? item.onboardingSpinsByBet : null,
+        rewardBonusSpinsByBet: item?.rewardBonusSpinsByBet && typeof item.rewardBonusSpinsByBet === 'object' ? item.rewardBonusSpinsByBet : null,
         walletSecretHash: item?.walletSecretHash || null
       });
     }
@@ -806,6 +818,28 @@ const PAYOUT_WEIGHTS = {
   10000: [2500, 2500, 2500, 249, 1]
 };
 
+// Bonus-mode scripted sequences are split by bankroll band:
+// - starter: a little friendlier so the first spins feel alive
+// - hover: encourages the promo bankroll to linger around the middle
+// - high: gets harsher after 100+ SATS so the bankroll fades back down
+const REWARD_BONUS_SCRIPTED_PAYOUTS_BY_BET = {
+  20: {
+    starter: [20, 20, 10, 30, 20, 10, 20, 40, 10, 20, 30, 0, 20, 10, 50, 20, 10, 20, 30, 0, 40, 20, 10, 20],
+    hover: [10, 20, 0, 20, 10, 30, 0, 20, 10, 20, 0, 40, 10, 20, 0, 30, 10, 20, 0, 50, 10, 20, 0, 30],
+    high: [0, 10, 0, 20, 0, 10, 20, 0, 0, 30, 10, 0, 20, 0, 10, 0, 40, 0, 10, 20, 0, 0, 30, 0]
+  },
+  100: {
+    starter: [100, 120, 100, 80, 100, 150, 80, 100, 120, 50, 100, 120],
+    hover: [80, 100, 50, 100, 120, 80, 100, 50, 120, 80, 100, 0],
+    high: [50, 0, 80, 50, 0, 100, 50, 0, 80, 0, 50, 100]
+  },
+  300: [],
+  500: [],
+  1000: [],
+  5000: [],
+  10000: []
+};
+
 const ONBOARDING_PAYOUTS_BY_BET = {
   20: [50, 20, 50, 0, 0, 80],
   100: [120, 120, 50, 0, 50, 0]
@@ -899,9 +933,14 @@ function getWallet(walletId) {
     walletId: id,
     balanceSats: 0,
     holdSats: 0,
+    rewardBonusBalanceSats: 0,
     lightningAddress: null,
+    rewardClaimedAt: null,
+    rewardClaimedAddress: null,
+    rewardBonusDeactivatedAt: null,
     pendingWithdrawal: null,
     lastWithdrawal: null,
+    rewardBonusSpinsByBet: null,
     lastActivityAt: now,
     createdAt: now
   };
@@ -959,11 +998,162 @@ function setWalletBalance(walletId, balanceSats) {
   return next;
 }
 
+function getRewardBonusBalance(walletId) {
+  const w = getWallet(walletId);
+  return Math.max(0, Number(w.rewardBonusBalanceSats) || 0);
+}
+
+function setRewardBonusBalance(walletId, rewardBonusBalanceSats) {
+  const w = getWallet(walletId);
+  const next = Math.max(0, Math.floor(Number(rewardBonusBalanceSats) || 0));
+  w.rewardBonusBalanceSats = next;
+  w.updatedAt = new Date().toISOString();
+  scheduleWalletStoreSave();
+  scheduleLiabilitiesReportWrite();
+  return next;
+}
+
+function isRewardBonusOddsActive(wallet) {
+  const w = wallet && typeof wallet === 'object' ? wallet : getWallet(wallet);
+  return !w.rewardBonusDeactivatedAt && (Number(w.rewardBonusBalanceSats) || 0) > 0;
+}
+
+function buildRewardBonusState(walletId) {
+  const w = getWallet(walletId);
+  return {
+    rewardClaimedAt: w.rewardClaimedAt || null,
+    rewardClaimedAddress: w.rewardClaimedAddress || null,
+    rewardBonusBalanceSats: getRewardBonusBalance(w.walletId),
+    rewardBonusOddsActive: isRewardBonusOddsActive(w),
+    rewardBonusDeactivatedAt: w.rewardBonusDeactivatedAt || null
+  };
+}
+
+function buildWalletBalancePayload(walletId) {
+  const w = getWallet(walletId);
+  return {
+    walletId: w.walletId,
+    lightningAddress: w.lightningAddress,
+    balanceSats: getWalletBalance(w.walletId),
+    ...buildRewardBonusState(w.walletId)
+  };
+}
+
+function hasRewardClaimForLightningAddress(lightningAddress, excludeWalletId = null) {
+  const addr = formatLightningAddress(lightningAddress);
+  const excludeId = excludeWalletId ? formatWalletId(excludeWalletId) : null;
+  for (const wallet of walletsById.values()) {
+    if (!wallet?.rewardClaimedAt) continue;
+    if (excludeId && String(wallet.walletId || '') === excludeId) continue;
+    if (String(wallet.rewardClaimedAddress || wallet.lightningAddress || '').toLowerCase() === addr) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function disableRewardBonusForWallet(walletId, reason = 'topup') {
+  const w = getWallet(walletId);
+  if (!w.rewardClaimedAt) return false;
+  if ((Number(w.rewardBonusBalanceSats) || 0) <= 0 && w.rewardBonusDeactivatedAt) return false;
+  w.rewardBonusBalanceSats = 0;
+  if (!w.rewardBonusDeactivatedAt) w.rewardBonusDeactivatedAt = new Date().toISOString();
+  w.updatedAt = new Date().toISOString();
+  scheduleWalletStoreSave();
+  scheduleLiabilitiesReportWrite();
+  appendAuditEvent({
+    type: 'reward_bonus_deactivated',
+    walletId: w.walletId,
+    lightningAddress: w.lightningAddress || null,
+    amountSats: 0,
+    reason
+  });
+  return true;
+}
+
+function maybeGrantNewUserReward(walletId) {
+  const w = getWallet(walletId);
+  if (!w.lightningAddress) return { granted: false, reason: 'missing_lightning_address' };
+  if (w.rewardClaimedAt) return { granted: false, reason: 'already_claimed_for_wallet' };
+
+  const claimedElsewhere = hasRewardClaimForLightningAddress(w.lightningAddress, w.walletId);
+  if (claimedElsewhere) {
+    return { granted: false, reason: 'address_already_rewarded' };
+  }
+
+  const prevBalance = getWalletBalance(w.walletId);
+  const nextBalance = setWalletBalance(w.walletId, prevBalance + NEW_USER_REWARD_SATS);
+  const nextBonusBalance = setRewardBonusBalance(w.walletId, getRewardBonusBalance(w.walletId) + NEW_USER_REWARD_SATS);
+
+  w.rewardClaimedAt = new Date().toISOString();
+  w.rewardClaimedAddress = w.lightningAddress;
+  w.rewardBonusDeactivatedAt = null;
+  w.rewardBonusSpinsByBet = {};
+  w.updatedAt = new Date().toISOString();
+  scheduleWalletStoreSave();
+  scheduleLiabilitiesReportWrite();
+
+  appendAuditEvent({
+    type: 'new_user_reward',
+    walletId: w.walletId,
+    lightningAddress: w.lightningAddress,
+    amountSats: NEW_USER_REWARD_SATS,
+    balanceBeforeSats: prevBalance,
+    balanceAfterSats: nextBalance,
+    reason: 'first_login_reward'
+  });
+
+  return {
+    granted: true,
+    amountSats: NEW_USER_REWARD_SATS,
+    balanceSats: nextBalance,
+    rewardBonusBalanceSats: nextBonusBalance,
+    walletId: w.walletId,
+    lightningAddress: w.lightningAddress
+  };
+}
+
 function pickPayoutAmount(betAmount) {
   const opts = PAYOUT_TABLE[betAmount] || [0, betAmount];
   const weights = PAYOUT_WEIGHTS?.[betAmount] || null;
   const picked = pickWeighted(opts, weights);
   return { payoutAmount: picked.value, payoutOptions: opts, payoutWeights: picked.weights };
+}
+
+function buildRewardBonusPayoutTable() {
+  const out = {};
+  for (const [betKey, seqRaw] of Object.entries(REWARD_BONUS_SCRIPTED_PAYOUTS_BY_BET || {})) {
+    const parts = Array.isArray(seqRaw)
+      ? [seqRaw]
+      : (seqRaw && typeof seqRaw === 'object' ? Object.values(seqRaw) : []);
+    const seq = parts
+      .flatMap((part) => Array.isArray(part) ? part : [])
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    if (!seq.length) continue;
+    out[betKey] = Array.from(new Set(seq)).sort((a, b) => a - b);
+  }
+  return out;
+}
+
+function getRewardBonusBand(balanceAfterBetSats) {
+  const balance = Math.max(0, Math.floor(Number(balanceAfterBetSats) || 0));
+  if (balance >= 100) return 'high';
+  if (balance >= 60) return 'hover';
+  return 'starter';
+}
+
+function getRewardBonusSequenceForBet(betAmount, balanceAfterBetSats) {
+  const config = REWARD_BONUS_SCRIPTED_PAYOUTS_BY_BET?.[Number(betAmount)];
+  if (Array.isArray(config)) return { band: 'default', sequence: config };
+  if (!config || typeof config !== 'object') return { band: 'default', sequence: [] };
+
+  const band = getRewardBonusBand(balanceAfterBetSats);
+  const preferred = Array.isArray(config?.[band]) ? config[band] : [];
+  if (preferred.length) return { band, sequence: preferred };
+
+  const fallback = Object.values(config).find((part) => Array.isArray(part) && part.length > 0) || [];
+  return { band, sequence: fallback };
 }
 
 function pickPayoutAmountForWallet(walletId, betAmount) {
@@ -991,6 +1181,36 @@ function pickPayoutAmountForWallet(walletId, betAmount) {
     payoutAmount: Number.isFinite(scripted) ? scripted : base.payoutAmount,
     payoutOptions: base.payoutOptions,
     payoutWeights: base.payoutWeights
+  };
+}
+
+function pickRewardBonusPayoutAmountForWallet(walletId, betAmount) {
+  const bet = Number(betAmount);
+  const base = pickPayoutAmountForWallet(walletId, bet);
+  const rewardBonusBalanceAfterBet = getRewardBonusBalance(walletId);
+  const { band, sequence: seq } = getRewardBonusSequenceForBet(bet, rewardBonusBalanceAfterBet);
+  if (!Array.isArray(seq) || seq.length === 0) return { ...base, rewardBonusOddsActive: false };
+
+  const w = getWallet(walletId);
+  if (!w.rewardBonusSpinsByBet || typeof w.rewardBonusSpinsByBet !== 'object') {
+    w.rewardBonusSpinsByBet = {};
+  }
+
+  const key = `${String(bet)}:${band}`;
+  const idx = Math.max(0, Math.floor(Number(w.rewardBonusSpinsByBet?.[key]) || 0));
+  const scripted = Number(seq[idx % seq.length]);
+  const maxAllowedPayout = Math.max(0, MAX_REWARD_BONUS_BANKROLL_SATS - rewardBonusBalanceAfterBet);
+  const cappedScripted = Math.max(0, Math.min(maxAllowedPayout, Number.isFinite(scripted) ? scripted : 0));
+  w.rewardBonusSpinsByBet[key] = idx + 1;
+  w.updatedAt = new Date().toISOString();
+  scheduleWalletStoreSave();
+  scheduleLiabilitiesReportWrite();
+
+  return {
+    payoutAmount: cappedScripted,
+    payoutOptions: Array.from(new Set(seq.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n >= 0))).sort((a, b) => a - b),
+    payoutWeights: null,
+    rewardBonusOddsActive: true
   };
 }
 
@@ -1490,6 +1710,7 @@ async function processPaidInvoice(invoiceId, opts = {}) {
     }
 
     const prev = getWalletBalance(round.walletId);
+    disableRewardBonusForWallet(round.walletId, 'topup');
     const next = setWalletBalance(round.walletId, prev + topupAmount);
 
     appendAuditEvent({
@@ -1516,15 +1737,15 @@ async function processPaidInvoice(invoiceId, opts = {}) {
 
     if (sock) {
       sock.emit('walletBalance', {
-        walletId: round.walletId,
-        lightningAddress: round.lightningAddress,
-        balanceSats: next
+        ...buildWalletBalancePayload(round.walletId),
+        lightningAddress: round.lightningAddress
       });
       sock.emit('topUpConfirmed', {
         invoiceId,
         walletId: round.walletId,
         amountSats: topupAmount,
-        balanceSats: next
+        balanceSats: next,
+        ...buildRewardBonusState(round.walletId)
       });
     }
 
@@ -1749,7 +1970,9 @@ io.on('connection', (socket) => {
     betOptions: BET_OPTIONS,
     topUpOptions: TOPUP_OPTIONS,
     payoutTable: PAYOUT_TABLE,
-    payoutWeights: PAYOUT_WEIGHTS
+    payoutWeights: PAYOUT_WEIGHTS,
+    newUserRewardSats: NEW_USER_REWARD_SATS,
+    rewardBonusPayoutTable: buildRewardBonusPayoutTable()
   });
 
   socket.on('getWalletBalance', ({ walletId, walletSecret, lightningAddress }) => {
@@ -1758,17 +1981,23 @@ io.on('connection', (socket) => {
       const w = getWallet(walletId);
       if (lightningAddress) bindWalletAddress(w.walletId, lightningAddress);
       walletToSocket.set(w.walletId, socket.id);
+      const rewardGrant = maybeGrantNewUserReward(w.walletId);
       logLine('wallet_balance', {
         walletId: w.walletId,
         lightningAddress: w.lightningAddress,
         balanceSats: getWalletBalance(w.walletId),
         socketId: socket.id
       });
-      socket.emit('walletBalance', {
-        walletId: w.walletId,
-        lightningAddress: w.lightningAddress,
-        balanceSats: getWalletBalance(w.walletId)
-      });
+      socket.emit('walletBalance', buildWalletBalancePayload(w.walletId));
+      if (rewardGrant?.granted) {
+        socket.emit('newUserRewardGranted', {
+          walletId: w.walletId,
+          lightningAddress: w.lightningAddress,
+          rewardSats: rewardGrant.amountSats,
+          balanceSats: rewardGrant.balanceSats,
+          rewardBonusBalanceSats: rewardGrant.rewardBonusBalanceSats
+        });
+      }
     } catch {
       socket.emit('errorMessage', { message: 'Invalid wallet credentials' });
     }
@@ -1863,7 +2092,12 @@ io.on('connection', (socket) => {
       }
 
       const next = setWalletBalance(w.walletId, current - bet);
-      socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: next });
+      const rewardBonusActiveBeforeSpin = isRewardBonusOddsActive(w);
+      const rewardBonusBalanceBeforeSpin = getRewardBonusBalance(w.walletId);
+      if (rewardBonusActiveBeforeSpin) {
+        setRewardBonusBalance(w.walletId, Math.max(0, rewardBonusBalanceBeforeSpin - bet));
+      }
+      socket.emit('walletBalance', buildWalletBalancePayload(w.walletId));
 
       appendAuditEvent({
         type: 'spin_bet',
@@ -1874,12 +2108,15 @@ io.on('connection', (socket) => {
         balanceAfterSats: next
       });
 
-      const { payoutAmount, payoutOptions, payoutWeights } = pickPayoutAmountForWallet(w.walletId, bet);
+      const { payoutAmount, payoutOptions, payoutWeights, rewardBonusOddsActive } = rewardBonusActiveBeforeSpin
+        ? pickRewardBonusPayoutAmountForWallet(w.walletId, bet)
+        : pickPayoutAmountForWallet(w.walletId, bet);
       socket.emit('spinOutcome', {
         betAmount: bet,
         payoutAmount,
         payoutOptions,
-        payoutWeights
+        payoutWeights,
+        rewardBonusOddsActive: Boolean(rewardBonusActiveBeforeSpin && rewardBonusOddsActive !== false)
       });
 
       logLine('spin_outcome', {
@@ -1894,14 +2131,18 @@ io.on('connection', (socket) => {
       const creditedBalance = payoutAmount > 0
         ? setWalletBalance(w.walletId, next + payoutAmount)
         : next;
+      if (rewardBonusActiveBeforeSpin && payoutAmount > 0) {
+        setRewardBonusBalance(w.walletId, getRewardBonusBalance(w.walletId) + payoutAmount);
+      }
 
-      socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: creditedBalance });
+      socket.emit('walletBalance', buildWalletBalancePayload(w.walletId));
       socket.emit('payoutSent', {
         payoutAmount,
         recipient: 'wallet',
         creditedToWallet: true,
         balanceSats: creditedBalance,
-        payoutResponse: null
+        payoutResponse: null,
+        ...buildRewardBonusState(w.walletId)
       });
 
       appendAuditEvent({
@@ -1946,7 +2187,7 @@ io.on('connection', (socket) => {
       scheduleWalletStoreSave();
       scheduleLiabilitiesReportWrite();
 
-      socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: 0 });
+      socket.emit('walletBalance', buildWalletBalancePayload(w.walletId));
       socket.emit('withdrawalPending', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress });
 
       logLine('withdraw_pending', {
@@ -1994,7 +2235,14 @@ io.on('connection', (socket) => {
         scheduleWalletStoreSave();
         scheduleLiabilitiesReportWrite();
 
-        socket.emit('withdrawalSent', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress, payoutResponse: payoutResp, balanceSats: 0 });
+        socket.emit('withdrawalSent', {
+          walletId: w.walletId,
+          amountSats: amount,
+          recipient: formattedAddress,
+          payoutResponse: payoutResp,
+          balanceSats: 0,
+          ...buildRewardBonusState(w.walletId)
+        });
 
         logLine('withdraw_sent', {
           walletId: w.walletId,
@@ -2022,8 +2270,14 @@ io.on('connection', (socket) => {
         scheduleWalletStoreSave();
         scheduleLiabilitiesReportWrite();
 
-        socket.emit('walletBalance', { walletId: w.walletId, lightningAddress: formattedAddress, balanceSats: amount });
-        socket.emit('withdrawalFailed', { walletId: w.walletId, amountSats: amount, recipient: formattedAddress, error: String(e?.message || e) });
+        socket.emit('walletBalance', buildWalletBalancePayload(w.walletId));
+        socket.emit('withdrawalFailed', {
+          walletId: w.walletId,
+          amountSats: amount,
+          recipient: formattedAddress,
+          error: String(e?.message || e),
+          ...buildRewardBonusState(w.walletId)
+        });
 
         logLine('withdraw_failed', {
           walletId: w.walletId,
