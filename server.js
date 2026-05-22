@@ -1208,7 +1208,7 @@ function pickRewardBonusPayoutAmountForWallet(walletId, betAmount) {
 
   return {
     payoutAmount: cappedScripted,
-    payoutOptions: Array.from(new Set(seq.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n >= 0))).sort((a, b) => a - b),
+    payoutOptions: base.payoutOptions,
     payoutWeights: null,
     rewardBonusOddsActive: true
   };
@@ -1971,8 +1971,7 @@ io.on('connection', (socket) => {
     topUpOptions: TOPUP_OPTIONS,
     payoutTable: PAYOUT_TABLE,
     payoutWeights: PAYOUT_WEIGHTS,
-    newUserRewardSats: NEW_USER_REWARD_SATS,
-    rewardBonusPayoutTable: buildRewardBonusPayoutTable()
+    newUserRewardSats: NEW_USER_REWARD_SATS
   });
 
   socket.on('getWalletBalance', ({ walletId, walletSecret, lightningAddress }) => {
