@@ -138,6 +138,7 @@ function serializeWallet(w) {
     holdSats: Number(w.holdSats) || 0,
     rewardBonusBalanceSats: Number(w.rewardBonusBalanceSats) || 0,
     rewardBonusWageredSats: Number(w.rewardBonusWageredSats) || 0,
+    rewardBonusWageredSatsByBet: w.rewardBonusWageredSatsByBet && typeof w.rewardBonusWageredSatsByBet === 'object' ? w.rewardBonusWageredSatsByBet : null,
     lightningAddress: w.lightningAddress || null,
     createdAt: w.createdAt || null,
     updatedAt: w.updatedAt || null,
@@ -451,6 +452,7 @@ function loadWalletStore() {
         holdSats: Math.max(0, Math.floor(Number(item?.holdSats) || 0)),
         rewardBonusBalanceSats: Math.max(0, Math.floor(Number(item?.rewardBonusBalanceSats) || 0)),
         rewardBonusWageredSats: Math.max(0, Math.floor(Number(item?.rewardBonusWageredSats) || 0)),
+        rewardBonusWageredSatsByBet: item?.rewardBonusWageredSatsByBet && typeof item.rewardBonusWageredSatsByBet === 'object' ? item.rewardBonusWageredSatsByBet : {},
         lightningAddress: item?.lightningAddress ? String(item.lightningAddress) : null,
         createdAt: item?.createdAt || null,
         updatedAt: item?.updatedAt || null,
@@ -963,6 +965,7 @@ function getWallet(walletId) {
     holdSats: 0,
     rewardBonusBalanceSats: 0,
     rewardBonusWageredSats: 0,
+    rewardBonusWageredSatsByBet: {},
     lightningAddress: null,
     rewardClaimedAt: null,
     rewardClaimedAddress: null,
@@ -1057,6 +1060,26 @@ function setRewardBonusWagered(walletId, rewardBonusWageredSats) {
   return next;
 }
 
+function getRewardBonusWageredForBet(walletId, betAmount) {
+  const w = getWallet(walletId);
+  const bet = String(Number(betAmount));
+  return Math.max(0, Number(w.rewardBonusWageredSatsByBet?.[bet]) || 0);
+}
+
+function setRewardBonusWageredForBet(walletId, betAmount, rewardBonusWageredSats) {
+  const w = getWallet(walletId);
+  if (!w.rewardBonusWageredSatsByBet || typeof w.rewardBonusWageredSatsByBet !== 'object') {
+    w.rewardBonusWageredSatsByBet = {};
+  }
+  const bet = String(Number(betAmount));
+  const next = Math.max(0, Math.floor(Number(rewardBonusWageredSats) || 0));
+  w.rewardBonusWageredSatsByBet[bet] = next;
+  w.updatedAt = new Date().toISOString();
+  scheduleWalletStoreSave();
+  scheduleLiabilitiesReportWrite();
+  return next;
+}
+
 function getRewardBonusWagerLimitForBet(betAmount) {
   const bet = Number(betAmount);
   const limit = REWARD_BONUS_WAGER_LIMIT_SATS_BY_BET?.[bet] ?? REWARD_BONUS_WAGER_LIMIT_SATS_BY_BET.default;
@@ -1142,6 +1165,7 @@ function maybeGrantNewUserReward(walletId) {
   rewardedLightningAddresses.add(formatLightningAddress(w.lightningAddress));
   w.rewardBonusDeactivatedAt = null;
   w.rewardBonusWageredSats = 0;
+  w.rewardBonusWageredSatsByBet = {};
   w.rewardBonusSpinsByBet = {};
   w.updatedAt = new Date().toISOString();
   scheduleWalletStoreSave();
@@ -2163,9 +2187,10 @@ io.on('connection', (socket) => {
       let rewardBonusActiveForPayout = rewardBonusActiveBeforeSpin;
       if (rewardBonusActiveBeforeSpin) {
         setRewardBonusBalance(w.walletId, Math.max(0, rewardBonusBalanceBeforeSpin - bet));
-        const nextRewardBonusWagered = setRewardBonusWagered(w.walletId, getRewardBonusWagered(w.walletId) + bet);
+        setRewardBonusWagered(w.walletId, getRewardBonusWagered(w.walletId) + bet);
+        const nextRewardBonusWageredForBet = setRewardBonusWageredForBet(w.walletId, bet, getRewardBonusWageredForBet(w.walletId, bet) + bet);
         const rewardBonusWagerLimit = getRewardBonusWagerLimitForBet(bet);
-        if (rewardBonusWagerLimit > 0 && nextRewardBonusWagered >= rewardBonusWagerLimit) {
+        if (rewardBonusWagerLimit > 0 && nextRewardBonusWageredForBet >= rewardBonusWagerLimit) {
           disableRewardBonusForWallet(w.walletId, 'wager_limit_reached');
           rewardBonusActiveForPayout = false;
         }
